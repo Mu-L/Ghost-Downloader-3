@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any, Self
 
 from PySide6.QtCore import QEvent, Qt, QPoint, QTimer, Signal
-from PySide6.QtGui import QTextOption
-from PySide6.QtWidgets import QDialog, QFileDialog
+from PySide6.QtGui import QColor, QTextOption
+from PySide6.QtWidgets import QDialog, QFileDialog, QVBoxLayout
 from loguru import logger
 from qfluentwidgets import (
     MessageBoxBase,
@@ -18,7 +18,10 @@ from qfluentwidgets import (
     InfoBarPosition,
     Slider,
     BodyLabel,
+    FluentTitleBar,
 )
+from qfluentwidgets.common.style_sheet import FluentStyleSheet
+from qframelesswindow import FramelessDialog
 
 from app.bases.models import Task
 from app.services.core_service import coreService
@@ -93,6 +96,37 @@ class PreBlockNumCard(ParseSettingCard):
         return {"preBlockNum": self.slider.value()}
 
 
+class _StandaloneWrapper(FramelessDialog):
+    """Independent window wrapper for AddTaskDialog standalone mode."""
+
+    def __init__(self, addTaskDialog: "AddTaskDialog"):
+        super().__init__()
+        self._addTaskDialog = addTaskDialog
+
+        titleBar = FluentTitleBar(self)
+        titleBar.maxBtn.hide()
+        titleBar.iconLabel.hide()
+        titleBar.setDoubleClickEnabled(False)
+        self.setTitleBar(titleBar)
+        self.setWindowTitle(addTaskDialog.tr("添加任务"))
+
+        self._contentLayout = QVBoxLayout(self)
+        self._contentLayout.setContentsMargins(0, 48, 0, 0)
+        self._contentLayout.setSpacing(0)
+
+        FluentStyleSheet.DIALOG.apply(self)
+
+    def setContent(self, widget):
+        self._contentLayout.addWidget(widget)
+
+    def takeContent(self, widget):
+        self._contentLayout.removeWidget(widget)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self._addTaskDialog.reject()
+
+
 @dataclass
 class _LineParseState:
     url: str
@@ -130,6 +164,11 @@ class AddTaskDialog(MessageBoxBase):
         self._confirmedTasks: list[Task] = []
         self._payloadOverrides: dict[str, dict[str, Any]] = {}  # TODO, 这是一种临时解决方案, 最佳方案是让 ResultCard 可以自定义 Payload
         self._requestSerial = 0
+
+        self._maskParent = parent
+        self._standaloneWrapper: _StandaloneWrapper | None = None
+        self._isStandaloneMode = False
+        self._isSwitchingMode = False
 
         self.initWidget()
         self.initLayout()
@@ -220,6 +259,52 @@ class AddTaskDialog(MessageBoxBase):
     def appendUrlWithPayload(self, url: str, payloadOverride: dict[str, Any]):
         self._payloadOverrides[url] = payloadOverride
         self.appendUrls([url])
+
+    def appendParsedTasks(self, tasks: list[Task]):
+        """Add pre-parsed tasks directly, skipping URL re-parse."""
+        if not tasks:
+            return
+
+        existingUrls = {state.url for state in self._lineStates}
+        newUrlLines: list[str] = []
+
+        for task in tasks:
+            url = task.url
+            if url in existingUrls:
+                for state in self._lineStates:
+                    if state.url == url:
+                        if state.status == "success":
+                            break
+                        self._disposeLineState(state, cancelRequest=True)
+                        self._applyParsedTaskToState(state, task)
+                        break
+                continue
+
+            existingUrls.add(url)
+            newUrlLines.append(url)
+            state = _LineParseState(url=url)
+            self._applyParsedTaskToState(state, task)
+            self._lineStates.append(state)
+
+        if newUrlLines:
+            self.urlEdit.blockSignals(True)
+            self.urlEdit.appendPlainText("\n".join(newUrlLines))
+            self.urlEdit.blockSignals(False)
+
+        self._rebuildResultCards()
+
+    def _applyParsedTaskToState(self, state: _LineParseState, task: Task):
+        try:
+            state.task = task
+            state.status = "success"
+            state.resultCard = featureService.createResultCard(
+                task, self.parseResultGroup
+            )
+        except Exception as e:
+            state.status = "error"
+            state.task = None
+            logger.opt(exception=e).error("无法创建解析结果卡片 {}", state.url)
+            self._showParseError(state.url, self.tr("解析结果处理失败"))
 
     def getPayload(self, url) -> dict[str, Any]:
         payload = self.getCurrentPayload()
@@ -312,6 +397,11 @@ class AddTaskDialog(MessageBoxBase):
 
         self.parseResultGroup.updateGeometry()
 
+    def _infoBarParent(self):
+        if self._isStandaloneMode and self._standaloneWrapper is not None:
+            return self._standaloneWrapper
+        return self
+
     def _showParseError(self, url: str, error: str | None = None):
         displayUrl = url if len(url) <= 48 else f"{url[:45]}..."
 
@@ -322,7 +412,7 @@ class AddTaskDialog(MessageBoxBase):
             content,
             duration=-1,
             position=InfoBarPosition.BOTTOM_RIGHT,
-            parent=self,
+            parent=self._infoBarParent(),
         )
 
     def _refreshParsingState(self):
@@ -424,14 +514,104 @@ class AddTaskDialog(MessageBoxBase):
         self._confirmedTasks.clear()
         return tasks
 
+    @property
+    def isStandaloneMode(self) -> bool:
+        return self._isStandaloneMode
+
+    def _ensureStandaloneWrapper(self) -> _StandaloneWrapper:
+        if self._standaloneWrapper is None:
+            self._standaloneWrapper = _StandaloneWrapper(self)
+        return self._standaloneWrapper
+
+    def _enterStandaloneMode(self):
+        """Move self.widget from mask overlay into the standalone wrapper."""
+        wrapper = self._ensureStandaloneWrapper()
+        if self._maskParent is not None:
+            self._maskParent.removeEventFilter(self)
+        self.setParent(None)
+        self._hBoxLayout.removeWidget(self.widget)
+        wrapper.setContent(self.widget)
+        self.widget.setStyleSheet("#centerWidget { border: none; border-radius: 0; }")
+        self.widget.show()
+        self.titleLabel.hide()
+        self._isStandaloneMode = True
+
+    def _exitStandaloneMode(self):
+        """Move self.widget back into the mask overlay."""
+        if not self._isStandaloneMode:
+            return
+        wrapper = self._standaloneWrapper
+        if wrapper is not None:
+            wrapper.hide()
+            wrapper.takeContent(self.widget)
+        self.widget.setStyleSheet("")
+        self._hBoxLayout.addWidget(self.widget, 1, Qt.AlignCenter)
+        self.widget.show()
+        self.titleLabel.show()
+        self.setParent(self._maskParent)
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        if self._maskParent is not None:
+            self._maskParent.installEventFilter(self)
+        self._isStandaloneMode = False
+
+    def showStandalone(self):
+        """Show dialog as an independent standalone window."""
+        if self._isStandaloneMode and self._standaloneWrapper is not None and self._standaloneWrapper.isVisible():
+            self._standaloneWrapper.raise_()
+            self._standaloneWrapper.activateWindow()
+            return
+
+        if self.isVisible() and not self._isStandaloneMode:
+            self._isSwitchingMode = True
+            self.setGraphicsEffect(None)
+            self.widget.setGraphicsEffect(None)
+            QDialog.done(self, QDialog.DialogCode.Rejected)
+            self._isSwitchingMode = False
+
+        if not self._isStandaloneMode:
+            self._enterStandaloneMode()
+
+        wrapper = self._standaloneWrapper
+        wrapper.resize(self.widget.width(), 600)
+        wrapper.show()
+        wrapper.raise_()
+        wrapper.activateWindow()
+
+    def showMask(self) -> int:
+        """Show dialog as a mask overlay (blocks via exec).
+        Returns the QDialog result code."""
+        if self._isStandaloneMode:
+            self._exitStandaloneMode()
+
+        # MaskDialogBase.done() clears widget.graphicsEffect via setGraphicsEffect(None),
+        # so shadow and mask must be re-applied before each exec().
+        if self._maskParent is not None:
+            self.setGeometry(0, 0, self._maskParent.width(), self._maskParent.height())
+            self.windowMask.resize(self.size())
+        self.setShadowEffect(60, (0, 10), QColor(0, 0, 0, 50))
+        self.setMaskColor(QColor(0, 0, 0, 76))
+
+        return self.exec()
+
     def done(self, code):
+        if self._isSwitchingMode:
+            QDialog.done(self, code)
+            return
+
         if code == QDialog.DialogCode.Rejected:
             self._confirmedTasks.clear()
             self._clearEditorState()
         elif code == QDialog.DialogCode.Accepted:
             self._commitAcceptedTasks()
 
-        super().done(code)
+        for task in self.takeConfirmedTasks():
+            self.taskConfirmed.emit(task)
+
+        if self._isStandaloneMode:
+            self._exitStandaloneMode()
+        else:
+            super().done(code)
 
     def validate(self) -> bool:
         self._timer.stop()
@@ -440,10 +620,11 @@ class AddTaskDialog(MessageBoxBase):
         return any(state.status in {"pending", "success"} for state in self._lineStates)
 
     @classmethod
-    def initialize(cls, parent=None):
+    def initialize(cls, mainWindow) -> Self:
+        """Create the singleton (if needed) and connect taskConfirmed to mainWindow.addTask."""
         if cls.instance is None:
-            cls.instance = cls(parent)
-
+            cls.instance = cls(mainWindow)
+            cls.instance.taskConfirmed.connect(mainWindow.addTask)
         return cls.instance
 
     def eventFilter(self, obj, e: QEvent):

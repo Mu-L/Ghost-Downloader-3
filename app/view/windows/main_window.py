@@ -248,11 +248,7 @@ class MainWindow(MSFluentWindow):
         QDesktopServices.openUrl(QUrl(FEEDBACK_URL))
 
     def _getAddTaskDialog(self) -> AddTaskDialog:
-        if AddTaskDialog.instance is None:
-            instance = AddTaskDialog.initialize(self)
-            instance.taskConfirmed.connect(self.addTask)
-
-        return AddTaskDialog.instance
+        return AddTaskDialog.initialize(self)
 
     def _restoreGeometry(self):
         self.resize(960, 540)
@@ -305,12 +301,8 @@ class MainWindow(MSFluentWindow):
             triggeredByUser: bool = False,
             urls: list[str] | None = None,
             payloadOverrides: dict[str, dict[str, Any]] | None = None,
-            raiseWindow: bool = False,
     ):
         dialog = self._getAddTaskDialog()
-
-        if raiseWindow:
-            bringWindowToTop(self)
 
         if urls:
             pendingUrls: list[str] = []
@@ -325,14 +317,28 @@ class MainWindow(MSFluentWindow):
             if pendingUrls:
                 dialog.appendUrls(pendingUrls)
 
-        if dialog.isVisible():
+        if dialog.isVisible() and not dialog.isStandaloneMode:
             dialog.raise_()
             dialog.activateWindow()
             return
 
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            for task in dialog.takeConfirmedTasks():
-                self.addTask(task)
+        dialog.showMask()
+
+    def showAddTaskDialogWithParsedTasks(self, tasks):
+        """Show AddTaskDialog with pre-parsed tasks (called by BrowserService).
+
+        macOS: mask mode (standalone cannot avoid raising MainWindow).
+        Other platforms: standalone mode.
+        """
+        dialog = self._getAddTaskDialog()
+        dialog.appendParsedTasks(tasks)
+
+        if sys.platform == "darwin":
+            bringWindowToTop(self)
+            if not dialog.isVisible():
+                dialog.showMask()
+        else:
+            dialog.showStandalone()
 
     def addTask(self, task) -> bool:
         try:

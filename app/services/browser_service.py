@@ -15,7 +15,6 @@ from app.services.core_service import coreService
 from app.services.feature_service import featureService
 from app.supports.config import VERSION, cfg
 from app.supports.recorder import taskRecorder
-from app.supports.signal_bus import signalBus
 from app.supports.utils import getProxies, openFile, openFolder
 
 if TYPE_CHECKING:
@@ -349,6 +348,13 @@ class BrowserService(QObject):
         if title:
             task.setTitle(title)
 
+        if cfg.enableRaiseWindowWhenReceiveMsg.value:
+            # Send ok=False BEFORE showing the dialog so the browser extension
+            # receives the response immediately (showMask blocks on macOS).
+            self._sendResult(session, BrowserMessageType.CREATE_TASK_RESULT, requestId, ok=False)
+            self.mainWindow.showAddTaskDialogWithParsedTasks([task])
+            return
+
         if not self.mainWindow.addTask(task):
             self._sendResult(
                 session,
@@ -358,9 +364,6 @@ class BrowserService(QObject):
                 message=self.tr("创建任务失败"),
             )
             return
-
-        if cfg.enableRaiseWindowWhenReceiveMsg.value:
-            signalBus.showMainWindow.emit()
 
         self._sendResult(session, BrowserMessageType.CREATE_TASK_RESULT, requestId, ok=True, taskId=task.taskId)
         self._broadcastTaskSnapshots()
