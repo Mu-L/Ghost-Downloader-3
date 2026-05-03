@@ -13,6 +13,7 @@ import {
 
 type ScriptFeatureKey = keyof typeof CAT_CATCH_SCRIPT_FEATURES;
 const SCRIPT_FEATURE_KEYS = Object.keys(CAT_CATCH_SCRIPT_FEATURES) as ScriptFeatureKey[];
+const FLUENT_PANEL_FEATURES = new Set<ScriptFeatureKey>(["recorder", "webrtc", "catch"]);
 
 export function createFeatureBridge() {
   const featureTabs = Object.fromEntries(
@@ -79,19 +80,34 @@ export function createFeatureBridge() {
     frameIds?: number[],
   ): Promise<void> {
     const feature = CAT_CATCH_SCRIPT_FEATURES[key];
-    const files = [`catch-script/${feature.script}`];
-    if (feature.i18n) {
-      files.unshift("catch-script/i18n.js");
+    const usesFluentPanel = FLUENT_PANEL_FEATURES.has(key);
+    const target = feature.allFrames
+      ? frameIds
+        ? { tabId, frameIds }
+        : { tabId, allFrames: true }
+      : { tabId, frameIds: frameIds ?? [MAIN_FRAME_ID] };
+    const world = feature.world as chrome.scripting.ExecutionWorld;
+    const files = [
+      ...(feature.i18n ? ["catch-script/i18n.js"] : []),
+      ...(usesFluentPanel ? ["catch-script/fluent-ui.js"] : []),
+      `catch-script/${feature.script}`,
+    ];
+    if (usesFluentPanel) {
+      await chrome.scripting.executeScript({
+        args: [chrome.runtime.getURL("icon48.png")],
+        func: (iconUrl: string) => {
+          Reflect.set(window, "CatCatchFluentUIIcon", iconUrl);
+        },
+        injectImmediately: true,
+        target,
+        world,
+      });
     }
     await chrome.scripting.executeScript({
-      target: feature.allFrames
-        ? frameIds
-          ? { tabId, frameIds }
-          : { tabId, allFrames: true }
-        : { tabId, frameIds: frameIds ?? [MAIN_FRAME_ID] },
       files,
       injectImmediately: true,
-      world: feature.world as chrome.scripting.ExecutionWorld,
+      target,
+      world,
     });
   }
 
