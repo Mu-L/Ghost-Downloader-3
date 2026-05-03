@@ -34,7 +34,7 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content-script.js"],
+      "js": ["cat-catch-content-script.js", "content-script.js"],
       "run_at": "document_start",
       "all_frames": true
     }

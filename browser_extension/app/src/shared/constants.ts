@@ -1,5 +1,6 @@
 import type { AdvancedFeatureKey } from "./types";
 import { getInstallDirectory, isFirefoxExtension } from "./browser";
+import { CAT_CATCH_SCRIPT_FEATURES } from "./cat-catch";
 
 export const DEFAULT_SERVER_URL = "ws://127.0.0.1:14370";
 export const EXTENSION_VERSION = chrome.runtime.getManifest().version;
@@ -19,7 +20,7 @@ export const ADVANCED_FEATURES: Array<{
     key: "webrtc",
     title: "录制 WebRTC",
     description: "录制 WebRTC 实时通信内容",
-    reloadRequired: true,
+    reloadRequired: CAT_CATCH_SCRIPT_FEATURES.webrtc.reloadRequired,
   },
   {
     key: "recorder2",
@@ -36,13 +37,13 @@ export const ADVANCED_FEATURES: Array<{
     key: "search",
     title: "深度搜索",
     description: "深入分析页面请求资源",
-    reloadRequired: true,
+    reloadRequired: CAT_CATCH_SCRIPT_FEATURES.search.reloadRequired,
   },
   {
     key: "catch",
     title: "缓存捕捉",
     description: "捕捉浏览器缓存的资源",
-    reloadRequired: true,
+    reloadRequired: CAT_CATCH_SCRIPT_FEATURES.catch.reloadRequired,
   },
 ];
 

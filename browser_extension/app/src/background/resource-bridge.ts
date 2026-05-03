@@ -6,6 +6,7 @@ import {
   filenameFromUrl,
   sortResourcesForOnlineMerge,
 } from "../shared/utils";
+import { isCatCatchMedia } from "../shared/cat-catch";
 import {
   BRIDGE_HEADER_SNAPSHOTS_KEY,
   BRIDGE_LAST_ACTIVE_TAB_KEY,
@@ -40,10 +41,10 @@ type BridgeResourcePayload = {
   requestHeaders?: Record<string, string>;
 };
 
-type CatCatchResponseMeta = {
+type NetworkResponseMeta = {
   size: number;
-  type: string;
-  attachment: string;
+  mime: string;
+  filename: string;
   supportsRange: boolean;
 };
 
@@ -51,27 +52,9 @@ type DesktopRequestSender = <T extends DesktopRequestResult>(payload: Record<str
 type ResourceBucket = Map<string, CapturedResource>;
 
 const HEADER_WHITELIST = new Set(["referer", "origin", "cookie", "authorization"]);
-const DIRECT_MEDIA_EXTENSIONS = new Set([
-  "mp4",
-  "mkv",
-  "webm",
-  "mp3",
-  "flac",
-  "wav",
-  "m4a",
-  "mov",
-  "m4s",
-  "ts",
-  "flv",
-  "aac",
-  "ogg",
-  "opus",
-]);
-const DOWNLOAD_EXTENSIONS = new Set(["zip", "7z", "rar", "pdf", "exe", "msi", "dmg", "pkg", "apk", "iso"]);
 
 export function createResourceBridge(options: {
   sendDesktopRequest: DesktopRequestSender;
-  isDesktopReady: () => boolean;
 }) {
   let bridgePersistTimer: number | null = null;
   let bridgeStateReady = false;
@@ -79,8 +62,6 @@ export function createResourceBridge(options: {
 
   const resourceCache = new Map<number, ResourceBucket>();
   const resourcesById = new Map<string, CapturedResource>();
-  const headersByRequestId = new Map<string, Record<string, string>>();
-  const rangeRequestIds = new Set<string>();
   const headerSnapshotsByUrl = new Map<string, BridgeHeaderSnapshot>();
 
   function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
@@ -99,38 +80,6 @@ export function createResourceBridge(options: {
     return result;
   }
 
-  function parseHeaderList(headers: chrome.webRequest.HttpHeader[] | undefined): Record<string, string> {
-    const result: Record<string, string> = {};
-    for (const header of headers ?? []) {
-      if (!header.name) {
-        continue;
-      }
-      const name = header.name.toLowerCase();
-      if (!HEADER_WHITELIST.has(name)) {
-        continue;
-      }
-      const value = String(header.value ?? "").trim();
-      if (!value) {
-        continue;
-      }
-      result[name] = value;
-    }
-    return result;
-  }
-
-  function hasRangeHeader(headers: chrome.webRequest.HttpHeader[] | undefined): boolean {
-    return (headers ?? []).some((header) => {
-      if (!header.name) {
-        return false;
-      }
-      if (header.name.toLowerCase() !== "range") {
-        return false;
-      }
-      const value = String(header.value ?? "").toLowerCase();
-      return value.startsWith("bytes=");
-    });
-  }
-
   function trimFilename(value: string): string {
     const text = String(value || "").trim();
     if (!text) {
@@ -142,14 +91,6 @@ export function createResourceBridge(options: {
 
   function isCapturableUrl(rawUrl: string): boolean {
     return /^https?:/i.test(rawUrl);
-  }
-
-  function isBridgeResourceUrl(rawUrl: string): boolean {
-    return /^(https?:|blob:)/i.test(rawUrl);
-  }
-
-  function isCapturableTab(tab: chrome.tabs.Tab | null): boolean {
-    return Boolean(tab?.url && isCapturableUrl(tab.url));
   }
 
   function sortResources(resources: Iterable<CapturedResource>): CapturedResource[] {
@@ -173,10 +114,6 @@ export function createResourceBridge(options: {
     } catch {
       return text.split("#", 1)[0] ?? text;
     }
-  }
-
-  function normalizeResourceUrl(value: string): string {
-    return normalizeUrl(value, true);
   }
 
   function normalizeCapturedResource(resource: CapturedResource): CapturedResource {
@@ -207,86 +144,51 @@ export function createResourceBridge(options: {
     };
   }
 
-  function getResponseHeadersValue(headers: chrome.webRequest.HttpHeader[] | undefined): CatCatchResponseMeta {
-    const meta: CatCatchResponseMeta = {
-      size: 0,
-      type: "",
-      attachment: "",
-      supportsRange: false,
-    };
-
+  function responseMeta(headers: chrome.webRequest.HttpHeader[] | undefined): NetworkResponseMeta {
+    const meta: NetworkResponseMeta = { size: 0, mime: "", filename: "", supportsRange: false };
+    let contentLengthSize = 0;
+    let contentRangeSize = 0;
     for (const header of headers ?? []) {
-      if (!header.name) {
-        continue;
-      }
-      const name = header.name.toLowerCase();
+      const name = String(header.name ?? "").toLowerCase();
+      const value = String(header.value ?? "").trim();
       if (name === "content-length") {
-        const size = Number.parseInt(String(header.value ?? ""), 10);
-        if (meta.size <= 0 && Number.isFinite(size) && size > 0) {
-          meta.size = size;
+        const size = Number.parseInt(value, 10);
+        contentLengthSize = Number.isFinite(size) && size > 0 ? size : contentLengthSize;
+      } else if (name === "content-type") {
+        meta.mime = value.split(";")[0]?.trim().toLowerCase() ?? "";
+      } else if (name === "content-disposition") {
+        const match = /filename\*\s*=\s*UTF-8''([^;]+)|filename\s*=\s*"?([^";]+)"?/i.exec(value);
+        const filename = match?.[1] ?? match?.[2] ?? "";
+        try {
+          meta.filename = trimFilename(decodeURIComponent(filename));
+        } catch {
+          meta.filename = trimFilename(filename);
         }
-        continue;
-      }
-      if (name === "content-type") {
-        const type = String(header.value ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
-        if (type) {
-          meta.type = type;
-        }
-        continue;
-      }
-      if (name === "content-disposition") {
-        meta.attachment = String(header.value ?? "").trim();
-        continue;
-      }
-      if (name === "accept-ranges") {
-        const value = String(header.value ?? "").toLowerCase();
-        if (value.includes("bytes")) {
-          meta.supportsRange = true;
-        } else if (value.includes("none")) {
-          meta.supportsRange = false;
-        }
-        continue;
-      }
-      if (name === "content-range") {
-        const size = String(header.value ?? "").split("/")[1];
-        if (size && size !== "*") {
-          const totalSize = Number.parseInt(size, 10);
-          if (Number.isFinite(totalSize) && totalSize > 0) {
-            meta.size = totalSize;
-          }
-        }
+      } else if (name === "accept-ranges") {
+        meta.supportsRange = value.toLowerCase().includes("bytes");
+      } else if (name === "content-range") {
+        const size = Number.parseInt(value.split("/")[1] ?? "", 10);
+        contentRangeSize = Number.isFinite(size) && size > 0 ? size : contentRangeSize;
         meta.supportsRange = true;
       }
     }
-
+    meta.size = contentRangeSize || contentLengthSize;
     return meta;
   }
 
-  function filenameFromContentDisposition(value: string): string {
-    if (!value) {
-      return "";
+  function shouldCaptureNetworkResource(details: chrome.webRequest.OnResponseStartedDetails, meta: NetworkResponseMeta): boolean {
+    if (!isCapturableUrl(details.url)) {
+      return false;
     }
+    const extension = fileExtension(meta.filename || filenameFromUrl(details.url));
+    return details.type === "media" || isCatCatchMedia(extension, meta.mime);
+  }
 
-    const utf8Match = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(value);
-    if (utf8Match?.[1]) {
-      try {
-        return trimFilename(decodeURIComponent(utf8Match[1].trim().replace(/^"|"$/g, "")));
-      } catch {
-        return trimFilename(utf8Match[1].trim().replace(/^"|"$/g, ""));
-      }
+  function shouldCaptureRequestResource(details: chrome.webRequest.OnSendHeadersDetails): boolean {
+    if (!isCapturableUrl(details.url)) {
+      return false;
     }
-
-    const quotedMatch = /filename\s*=\s*"([^"]+)"/i.exec(value);
-    if (quotedMatch?.[1]) {
-      return trimFilename(quotedMatch[1]);
-    }
-
-    const plainMatch = /filename\s*=\s*([^;]+)/i.exec(value);
-    if (plainMatch?.[1]) {
-      return trimFilename(plainMatch[1].trim().replace(/^"|"$/g, ""));
-    }
-
-    return "";
+    return details.type === "media" || isCatCatchMedia(fileExtension(filenameFromUrl(details.url)));
   }
 
   function urlsLikelySamePage(left: string, right: string): boolean {
@@ -330,55 +232,6 @@ export function createResourceBridge(options: {
     }
 
     return null;
-  }
-
-  function shouldCaptureCatCatchResponse(
-    details: chrome.webRequest.OnResponseStartedDetails,
-    responseMeta: CatCatchResponseMeta,
-  ): boolean {
-    if (!isCapturableUrl(details.url)) {
-      return false;
-    }
-
-    const extension = fileExtension(filenameFromContentDisposition(responseMeta.attachment) || filenameFromUrl(details.url));
-
-    if (details.type === "media") {
-      return true;
-    }
-    if (extension === "m3u8" || extension === "m3u" || extension === "mpd") {
-      return true;
-    }
-    if (DIRECT_MEDIA_EXTENSIONS.has(extension) || DOWNLOAD_EXTENSIONS.has(extension)) {
-      return true;
-    }
-    if (responseMeta.type.startsWith("video/") || responseMeta.type.startsWith("audio/")) {
-      return true;
-    }
-    if (responseMeta.type.includes("mpegurl") || responseMeta.type === "application/dash+xml") {
-      return true;
-    }
-
-    return Boolean(filenameFromContentDisposition(responseMeta.attachment));
-  }
-
-  function resolveNetworkResourceFilename(rawUrl: string, responseMeta: CatCatchResponseMeta): string {
-    const fromDisposition = filenameFromContentDisposition(responseMeta.attachment);
-    if (fromDisposition) {
-      return fromDisposition;
-    }
-
-    const fromUrl = trimFilename(filenameFromUrl(rawUrl) || "");
-    if (fromUrl) {
-      return fromUrl;
-    }
-
-    if (responseMeta.type.includes("mpegurl")) {
-      return "resource.m3u8";
-    }
-    if (responseMeta.type === "application/dash+xml") {
-      return "resource.mpd";
-    }
-    return "resource";
   }
 
   async function persistBridgeState() {
@@ -471,6 +324,11 @@ export function createResourceBridge(options: {
       }
     }
 
+    const activeTabId = await refreshActiveTabFromBrowser();
+    if (activeTabId != null) {
+      return activeTabId;
+    }
+
     if (lastActiveTabId != null) {
       const current = await getTab(lastActiveTabId);
       if (current?.id) {
@@ -478,7 +336,7 @@ export function createResourceBridge(options: {
       }
     }
 
-    return refreshActiveTabFromBrowser();
+    return null;
   }
 
   function filenameWithExtension(baseName: string, extension: string): string {
@@ -528,22 +386,12 @@ export function createResourceBridge(options: {
     if (details.tabId > 0) {
       return details.tabId;
     }
-
-    const snapshotTabId = headerSnapshotsByUrl.get(details.url)?.tabId;
+    const snapshotTabId = resolveHeaderSnapshot(details.url)?.tabId;
     if (snapshotTabId != null) {
       return snapshotTabId;
     }
-
     const matchedTabId = await resolveTabIdFromPageUrl(details.initiator ?? "");
-    if (matchedTabId != null) {
-      return matchedTabId;
-    }
-
-    return resolveActiveTabId();
-  }
-
-  function buildResourceId(tabId: number, url: string): string {
-    return `${tabId}:${normalizeResourceUrl(url)}`;
+    return matchedTabId ?? resolveActiveTabId();
   }
 
   function bucketForTab(tabId: number): ResourceBucket {
@@ -588,10 +436,10 @@ export function createResourceBridge(options: {
           size: normalized.size > 0 ? normalized.size : existing.size,
           supportsRange: normalized.supportsRange || existing.supportsRange,
           referer: normalized.referer || existing.referer,
-          requestHeaders:
-            Object.keys(normalized.requestHeaders).length > 0
-              ? normalized.requestHeaders
-              : existing.requestHeaders,
+          requestHeaders: {
+            ...normalized.requestHeaders,
+            ...existing.requestHeaders,
+          },
           capturedAt: Math.max(existing.capturedAt, normalized.capturedAt),
           sentToDesktopAt: existing.sentToDesktopAt ?? normalized.sentToDesktopAt,
         }
@@ -599,19 +447,27 @@ export function createResourceBridge(options: {
 
     bucket.set(merged.id, merged);
     resourcesById.set(merged.id, merged);
+    const mergedUrl = normalizeUrl(merged.url, true);
+    if (mergedUrl && (merged.size > 0 || merged.mime || merged.supportsRange)) {
+      for (const resource of resourcesById.values()) {
+        if (resource.id === merged.id || normalizeUrl(resource.url, true) !== mergedUrl) {
+          continue;
+        }
+        resource.size = merged.size > 0 ? merged.size : resource.size;
+        resource.mime = merged.mime || resource.mime;
+        resource.filename = resource.filename && resource.filename !== "resource" ? resource.filename : merged.filename;
+        resource.supportsRange = merged.supportsRange || resource.supportsRange;
+      }
+    }
     trimBucket(normalized.tabId);
     scheduleBridgeStatePersist();
   }
 
-  function findResourceById(resourceId: string): CapturedResource | null {
-    return resourcesById.get(resourceId) ?? null;
-  }
-
   function findResourceByUrl(rawUrl: string): CapturedResource | null {
-    const normalizedUrl = normalizeResourceUrl(rawUrl);
+    const normalizedUrl = normalizeUrl(rawUrl, true);
     let matched: CapturedResource | null = null;
     for (const resource of resourcesById.values()) {
-      if (normalizeResourceUrl(resource.url) !== normalizedUrl) {
+      if (normalizeUrl(resource.url, true) !== normalizedUrl) {
         continue;
       }
       if (matched == null || resource.capturedAt > matched.capturedAt) {
@@ -637,15 +493,21 @@ export function createResourceBridge(options: {
     supportsRange: boolean,
   ) {
     const normalized = normalizeHeaders(headers);
-    if (Object.keys(normalized).length === 0 && !supportsRange) {
+    const existing = headerSnapshotsByUrl.get(url);
+    const mergedHeaders = {
+      ...(existing?.headers ?? {}),
+      ...normalized,
+    };
+    const mergedSupportsRange = supportsRange || Boolean(existing?.supportsRange);
+    if (Object.keys(mergedHeaders).length === 0 && !mergedSupportsRange) {
       return;
     }
     headerSnapshotsByUrl.set(url, {
       url,
-      headers: normalized,
+      headers: mergedHeaders,
       capturedAt: Date.now(),
-      tabId,
-      supportsRange,
+      tabId: tabId ?? existing?.tabId ?? null,
+      supportsRange: mergedSupportsRange,
     });
     pruneHeaderSnapshots();
     scheduleBridgeStatePersist();
@@ -654,10 +516,6 @@ export function createResourceBridge(options: {
   function resolveHeaderSnapshot(url: string): BridgeHeaderSnapshot | null {
     pruneHeaderSnapshots();
     return headerSnapshotsByUrl.get(url) ?? null;
-  }
-
-  function resolveHeadersForDownload(url: string): Record<string, string> {
-    return { ...(resolveHeaderSnapshot(url)?.headers ?? {}) };
   }
 
   function otherResourcesForTab(activeTabId: number | null): CapturedResource[] {
@@ -756,17 +614,21 @@ export function createResourceBridge(options: {
 
   async function capturePageResource(sender: chrome.runtime.MessageSender, payload: BridgeResourcePayload) {
     const tabId = await resolveBridgeResourceTabId(sender, payload.href);
-    if (!tabId || !isBridgeResourceUrl(payload.url)) {
+    if (!tabId || !/^(https?:|blob:)/i.test(payload.url)) {
       return;
     }
 
     const tab = await getTab(tabId);
-    const headers = normalizeHeaders(payload.requestHeaders);
+    const headerSnapshot = resolveHeaderSnapshot(payload.url);
+    const headers = {
+      ...normalizeHeaders(headerSnapshot?.headers),
+      ...normalizeHeaders(payload.requestHeaders),
+    };
     const filename = resolveBridgeFilename(payload);
     const mime = String(payload.mime ?? "").toLowerCase();
 
     cacheResource({
-      id: buildResourceId(tabId, payload.url),
+      id: `${tabId}:${normalizeUrl(payload.url, true)}`,
       tabId,
       url: payload.url,
       pageTitle: tab?.title ?? "",
@@ -774,7 +636,7 @@ export function createResourceBridge(options: {
       filename,
       mime,
       size: 0,
-      supportsRange: false,
+      supportsRange: Boolean(headerSnapshot?.supportsRange),
       referer: headers.referer ?? payload.href ?? tab?.url ?? "",
       requestHeaders: headers,
       capturedAt: Date.now(),
@@ -782,66 +644,93 @@ export function createResourceBridge(options: {
   }
 
   async function captureNetworkResource(details: chrome.webRequest.OnResponseStartedDetails) {
-    const responseMeta = getResponseHeadersValue(details.responseHeaders);
-    if (!shouldCaptureCatCatchResponse(details, responseMeta)) {
-      headersByRequestId.delete(details.requestId);
-      rangeRequestIds.delete(details.requestId);
+    const meta = responseMeta(details.responseHeaders);
+    const responseSupportsRange = meta.supportsRange || details.statusCode === 206;
+    if (responseSupportsRange && isCapturableUrl(details.url)) {
+      rememberHeaderSnapshot(details.url, {}, details.tabId > 0 ? details.tabId : lastActiveTabId, true);
+    }
+
+    if (!shouldCaptureNetworkResource(details, meta)) {
       return;
     }
 
     const tabId = await resolveNetworkResourceTabId(details);
-    const headerSnapshot = resolveHeaderSnapshot(details.url);
-    const requestHadRange = rangeRequestIds.has(details.requestId) || Boolean(headerSnapshot?.supportsRange);
-    const requestHeaders = normalizeHeaders(headersByRequestId.get(details.requestId) ?? headerSnapshot?.headers ?? {});
-    headersByRequestId.delete(details.requestId);
-    rangeRequestIds.delete(details.requestId);
-
     if (!tabId) {
       return;
     }
 
     const tab = await getTab(tabId);
-    const filename = resolveNetworkResourceFilename(details.url, responseMeta);
-    const referer = requestHeaders.referer || details.initiator || tab?.url || "";
-    const normalizedRequestHeaders = referer ? { ...requestHeaders, referer } : requestHeaders;
+    const headerSnapshot = resolveHeaderSnapshot(details.url);
+    const headers = normalizeHeaders(headerSnapshot?.headers);
+    const referer = headers.referer || (details.initiator && details.initiator !== "null" ? details.initiator : tab?.url) || "";
+    if (referer) {
+      headers.referer = referer;
+    }
 
     cacheResource({
-      id: buildResourceId(tabId, details.url),
+      id: `${tabId}:${normalizeUrl(details.url, true)}`,
       tabId,
       url: details.url,
       pageTitle: tab?.title ?? "",
-      pageUrl: details.initiator ?? tab?.url ?? "",
-      filename,
-      mime: responseMeta.type,
-      size: responseMeta.size,
-      supportsRange:
-        responseMeta.supportsRange
-        || details.statusCode === 206
-        || requestHadRange,
+      pageUrl: details.initiator && details.initiator !== "null" ? details.initiator : tab?.url ?? "",
+      filename: meta.filename || trimFilename(filenameFromUrl(details.url)) || "resource",
+      mime: meta.mime,
+      size: meta.size,
+      supportsRange: responseSupportsRange || Boolean(headerSnapshot?.supportsRange),
       referer,
-      requestHeaders: normalizedRequestHeaders,
+      requestHeaders: headers,
       capturedAt: Date.now(),
     });
   }
 
-  function shouldHandoffBrowserDownload(
-    downloadItem: chrome.downloads.DownloadItem,
-    interceptDownloads: boolean,
-  ): boolean {
-    const finalUrl = downloadItem.finalUrl || downloadItem.url;
-    return Boolean(interceptDownloads && options.isDesktopReady() && isCapturableUrl(finalUrl));
+  async function captureRequestResource(details: chrome.webRequest.OnSendHeadersDetails) {
+    if (!shouldCaptureRequestResource(details)) {
+      return;
+    }
+
+    const tabId = details.tabId > 0 ? details.tabId : (lastActiveTabId ?? await resolveActiveTabId());
+    if (!tabId) {
+      return;
+    }
+
+    const tab = await getTab(tabId);
+    const headers = normalizeHeaders(Object.fromEntries((details.requestHeaders ?? []).map((header) => [header.name ?? "", header.value ?? ""])));
+    const referer = headers.referer || (details.initiator && details.initiator !== "null" ? details.initiator : tab?.url) || "";
+    if (referer) {
+      headers.referer = referer;
+    }
+
+    cacheResource({
+      id: `${tabId}:${normalizeUrl(details.url, true)}`,
+      tabId,
+      url: details.url,
+      pageTitle: tab?.title ?? "",
+      pageUrl: details.initiator && details.initiator !== "null" ? details.initiator : tab?.url ?? "",
+      filename: trimFilename(filenameFromUrl(details.url)) || "resource",
+      mime: "",
+      size: 0,
+      supportsRange: (details.requestHeaders ?? []).some((header) => header.name?.toLowerCase() === "range"),
+      referer,
+      requestHeaders: headers,
+      capturedAt: Date.now(),
+    });
   }
 
   async function handoffBrowserDownload(downloadItem: chrome.downloads.DownloadItem) {
     const finalUrl = downloadItem.finalUrl || downloadItem.url;
-    const matchedResource = findResourceByUrl(finalUrl);
+    const matchedResource =
+      findResourceByUrl(finalUrl)
+      ?? (downloadItem.url !== finalUrl ? findResourceByUrl(downloadItem.url) : null);
     const resolvedFilename =
       trimFilename(downloadItem.filename)
       || trimFilename(matchedResource?.filename ?? "")
       || trimFilename(filenameFromUrl(finalUrl))
       || "resource";
 
-    const headers = resolveHeadersForDownload(finalUrl);
+    const headerSnapshot =
+      resolveHeaderSnapshot(finalUrl)
+      ?? (downloadItem.url !== finalUrl ? resolveHeaderSnapshot(downloadItem.url) : null);
+    const headers = { ...(headerSnapshot?.headers ?? {}) };
     if (downloadItem.referrer && !headers.referer) {
       headers.referer = downloadItem.referrer;
     }
@@ -859,7 +748,11 @@ export function createResourceBridge(options: {
             typeof downloadItem.totalBytes === "number" && downloadItem.totalBytes > 0
               ? downloadItem.totalBytes
               : matchedResource?.size ?? 0,
-          supportsRange: matchedResource?.supportsRange ?? downloadItem.canResume === true,
+          supportsRange: Boolean(
+            matchedResource?.supportsRange
+            || headerSnapshot?.supportsRange
+            || downloadItem.canResume === true,
+          ),
         },
       });
       if (result.ok) {
@@ -902,7 +795,7 @@ export function createResourceBridge(options: {
   }
 
   async function sendResource(resourceId: string): Promise<DesktopRequestResult> {
-    const resource = findResourceById(resourceId);
+    const resource = resourcesById.get(resourceId) ?? null;
     if (!resource) {
       return { ok: false, message: "资源不存在" };
     }
@@ -929,7 +822,7 @@ export function createResourceBridge(options: {
   async function mergeResources(resourceIds: string[]): Promise<DesktopRequestResult> {
     const ids = [...new Set(resourceIds.map((value) => String(value || "")).filter(Boolean))];
     const resources = ids
-      .map((resourceId) => findResourceById(resourceId))
+      .map((resourceId) => resourcesById.get(resourceId) ?? null)
       .filter((resource): resource is CapturedResource => resource != null);
 
     if (resources.length !== 2) {
@@ -986,7 +879,7 @@ export function createResourceBridge(options: {
     PopupStatePayload,
     "resourceState" | "resourceStateMessage" | "currentResources" | "otherResources" | "activePageDomain"
   > {
-    const canCaptureCurrentTab = isCapturableTab(activeTab);
+    const canCaptureCurrentTab = Boolean(activeTab?.url && isCapturableUrl(activeTab.url));
     let resourceState: PopupStatePayload["resourceState"] = "ready";
     let resourceStateMessage = "等待 cat-catch 捕获资源";
     if (!bridgeStateReady) {
@@ -1023,29 +916,17 @@ export function createResourceBridge(options: {
   }
 
   function handleRequestHeaders(details: chrome.webRequest.OnSendHeadersDetails) {
-    const headers = parseHeaderList(details.requestHeaders);
-    headersByRequestId.set(details.requestId, headers);
-    const supportsRange = hasRangeHeader(details.requestHeaders);
-    if (supportsRange) {
-      rangeRequestIds.add(details.requestId);
-    } else {
-      rangeRequestIds.delete(details.requestId);
-    }
+    const headers = normalizeHeaders(Object.fromEntries((details.requestHeaders ?? []).map((header) => [header.name ?? "", header.value ?? ""])));
+    const supportsRange = (details.requestHeaders ?? []).some((header) => header.name?.toLowerCase() === "range" && String(header.value ?? "").toLowerCase().startsWith("bytes="));
     rememberHeaderSnapshot(details.url, headers, details.tabId > 0 ? details.tabId : lastActiveTabId, supportsRange);
-  }
-
-  function clearRequestHeaders(requestId: string) {
-    headersByRequestId.delete(requestId);
-    rangeRequestIds.delete(requestId);
   }
 
   return {
     buildPopupStateData,
     captureNetworkResource,
     capturePageResource,
-    clearRequestHeaders,
+    captureRequestResource,
     handoffBrowserDownload,
-    shouldHandoffBrowserDownload,
     handleNavigationCommitted,
     handleRequestHeaders,
     handleTabRemoved,

@@ -15,6 +15,7 @@ import { sortTasks } from "../../shared/utils";
 
 const REFRESH_INTERVAL_MS = 1000;
 const FLASH_TIMEOUT_MS = 2800;
+const MEDIA_COMMAND_TIMEOUT_MS = 300;
 
 type FlashTone = "neutral" | "success" | "error";
 
@@ -31,32 +32,6 @@ function sendRuntimeMessage<T>(message: unknown): Promise<T> {
   });
 }
 
-function sendMessageToTab<T>(
-  tabId: number,
-  message: Record<string, unknown>,
-  options?: chrome.tabs.MessageSendOptions,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(tabId, message, options ?? {}, (response: T) => {
-      const lastError = chrome.runtime.lastError;
-      if (lastError) {
-        reject(new Error(lastError.message));
-        return;
-      }
-      resolve(response);
-    });
-  });
-}
-
-async function highlightTab(tabId: number): Promise<void> {
-  const tab = await chrome.tabs.get(tabId);
-  if (typeof tab.index === "number" && typeof tab.windowId === "number") {
-    await chrome.tabs.highlight({ windowId: tab.windowId, tabs: tab.index });
-    return;
-  }
-  await chrome.tabs.update(tabId, { active: true });
-}
-
 function createEmptyFeatureStates(): FeatureStateMap {
   const state = {} as FeatureStateMap;
   for (const { key } of ADVANCED_FEATURES) {
@@ -68,12 +43,9 @@ function createEmptyFeatureStates(): FeatureStateMap {
 function createEmptyMediaState(): MediaPlaybackState {
   return {
     available: false,
-    stale: false,
     message: "",
     tabId: null,
     mediaIndex: -1,
-    frameId: 0,
-    count: 0,
     currentTime: 0,
     duration: 0,
     progress: 0,
@@ -82,7 +54,6 @@ function createEmptyMediaState(): MediaPlaybackState {
     loop: false,
     muted: false,
     speed: 1,
-    mediaType: "",
   };
 }
 
@@ -103,10 +74,7 @@ function createEmptyPayload(): PopupStatePayload {
     tabId: null,
     activePageDomain: "",
     featureStates: createEmptyFeatureStates(),
-    mediaTabs: [],
     mediaItems: [],
-    selectedMediaTabId: null,
-    selectedMediaIndex: -1,
     mediaPlaybackState: createEmptyMediaState(),
   };
 }
@@ -129,6 +97,56 @@ function updateBusyState<T>(
 
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+async function sendDesktopCommand(message: unknown, fallback: string) {
+  const result = await sendRuntimeMessage<DesktopRequestResult>(message);
+  if (!result.ok) {
+    throw new Error(result.message || fallback);
+  }
+  return result;
+}
+
+async function sendMediaMessage(tabId: number, message: Record<string, unknown>) {
+  return new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(resolve, MEDIA_COMMAND_TIMEOUT_MS);
+
+    chrome.tabs.sendMessage(tabId, message, () => {
+      window.clearTimeout(timeout);
+      const lastError = chrome.runtime.lastError;
+      if (lastError && !/message port closed before a response/i.test(lastError.message ?? "")) {
+        reject(new Error(lastError.message));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function sendFullscreenMessage(tabId: number, index: number) {
+  return new Promise<void>((resolve, reject) => {
+    chrome.tabs.get(tabId, (tab) => {
+      const tabError = chrome.runtime.lastError;
+      if (tabError || typeof tab.index !== "number" || typeof tab.windowId !== "number") {
+        reject(new Error(tabError?.message || "目标标签页不存在"));
+        return;
+      }
+
+      chrome.tabs.highlight({ windowId: tab.windowId, tabs: tab.index }, () => {
+        const highlightError = chrome.runtime.lastError;
+        if (highlightError) {
+          reject(new Error(highlightError.message));
+          return;
+        }
+
+        chrome.tabs.sendMessage(tabId, { Message: "fullScreen", index }, () => {
+          void chrome.runtime.lastError;
+          window.close();
+        });
+        resolve();
+      });
+    });
+  });
 }
 
 export function usePopupBridge(activeView: PopupView) {
@@ -238,14 +256,22 @@ export function usePopupBridge(activeView: PopupView) {
     updateBusyState(setBusyFeatureKeys, feature, active);
   }, []);
 
+  const requestPopupState = useCallback(
+    (message: Record<string, unknown>) =>
+      sendRuntimeMessage<PopupStatePayload>({
+        ...message,
+        view: requestView(activeViewRef.current),
+      }),
+    [requestView],
+  );
+
   const saveToken = useCallback(
     async (value: string) => {
       setIsSavingToken(true);
       try {
-        const next = await sendRuntimeMessage<PopupStatePayload>({
+        const next = await requestPopupState({
           type: "popup_set_token",
           token: value.trim(),
-          view: requestView(activeViewRef.current),
         });
         applyPopupState(next);
         setFlash(
@@ -262,17 +288,16 @@ export function usePopupBridge(activeView: PopupView) {
         }
       }
     },
-    [applyPopupState, requestView, setFlash],
+    [applyPopupState, requestPopupState, setFlash],
   );
 
   const saveServerUrl = useCallback(
     async (value: string) => {
       setIsSavingServerUrl(true);
       try {
-        const next = await sendRuntimeMessage<PopupStatePayload>({
+        const next = await requestPopupState({
           type: "popup_set_server_url",
           serverUrl: value,
-          view: requestView(activeViewRef.current),
         });
         applyPopupState(next);
         setFlash(
@@ -289,15 +314,14 @@ export function usePopupBridge(activeView: PopupView) {
         }
       }
     },
-    [applyPopupState, requestView, setFlash],
+    [applyPopupState, requestPopupState, setFlash],
   );
 
   const refreshConnection = useCallback(async () => {
     setIsRefreshingConnection(true);
     try {
-      const next = await sendRuntimeMessage<PopupStatePayload>({
+      const next = await requestPopupState({
         type: "popup_refresh_connection",
-        view: requestView(activeViewRef.current),
       });
       applyPopupState(next);
       setFlash(next.connectionMessage, next.connectionState === "connected" ? "success" : "neutral");
@@ -310,16 +334,15 @@ export function usePopupBridge(activeView: PopupView) {
         setIsRefreshingConnection(false);
       }
     }
-  }, [applyPopupState, requestView, setFlash]);
+  }, [applyPopupState, requestPopupState, setFlash]);
 
   const setInterceptDownloads = useCallback(
     async (enabled: boolean) => {
       setIsUpdatingIntercept(true);
       try {
-        const next = await sendRuntimeMessage<PopupStatePayload>({
+        const next = await requestPopupState({
           type: "popup_set_intercept_downloads",
           enabled,
-          view: requestView(activeViewRef.current),
         });
         applyPopupState(next);
       } catch (error) {
@@ -330,21 +353,18 @@ export function usePopupBridge(activeView: PopupView) {
         }
       }
     },
-    [applyPopupState, requestView, setFlash],
+    [applyPopupState, requestPopupState, setFlash],
   );
 
   const performTaskAction = useCallback(
     async (taskId: string, action: TaskAction) => {
       updateBusyState(setBusyTaskIds, taskId, true);
       try {
-        const result = await sendRuntimeMessage<DesktopRequestResult>({
+        await sendDesktopCommand({
           type: "popup_task_action",
           taskId,
           action,
-        });
-        if (!result.ok) {
-          throw new Error(result.message || "任务操作失败");
-        }
+        }, "任务操作失败");
         await refreshState(activeViewRef.current);
         setFlash("任务操作已发送", "success");
       } catch (error) {
@@ -360,13 +380,10 @@ export function usePopupBridge(activeView: PopupView) {
     async (resourceId: string) => {
       updateBusyState(setBusyResourceIds, resourceId, true);
       try {
-        const result = await sendRuntimeMessage<DesktopRequestResult>({
+        const result = await sendDesktopCommand({
           type: "popup_send_resource",
           resourceId,
-        });
-        if (!result.ok) {
-          throw new Error(result.message || "发送资源失败");
-        }
+        }, "发送资源失败");
         await refreshState(activeViewRef.current);
         setFlash(result.message || "资源处理成功", "success");
       } catch (error) {
@@ -383,13 +400,10 @@ export function usePopupBridge(activeView: PopupView) {
       const ids = [...new Set(resourceIds.map((value) => String(value || "")).filter(Boolean))];
       ids.forEach((resourceId) => updateBusyState(setBusyResourceIds, resourceId, true));
       try {
-        const result = await sendRuntimeMessage<DesktopRequestResult>({
+        const result = await sendDesktopCommand({
           type: "popup_merge_resources",
           resourceIds: ids,
-        });
-        if (!result.ok) {
-          throw new Error(result.message || "在线合并失败");
-        }
+        }, "在线合并失败");
         await refreshState(activeViewRef.current);
         setFlash(result.message || "资源已发送到 Ghost Downloader", "success");
         return true;
@@ -411,14 +425,11 @@ export function usePopupBridge(activeView: PopupView) {
       }
       setBusyFeature(feature, true);
       try {
-        const result = await sendRuntimeMessage<DesktopRequestResult>({
+        const result = await sendDesktopCommand({
           type: "popup_toggle_feature",
           feature,
           tabId: payload.tabId,
-        });
-        if (!result.ok) {
-          throw new Error(result.message || "功能切换失败");
-        }
+        }, "功能切换失败");
         await refreshState(activeViewRef.current);
         setFlash(result.message || "功能状态已更新", "success");
       } catch (error) {
@@ -430,14 +441,15 @@ export function usePopupBridge(activeView: PopupView) {
     [payload.tabId, refreshState, setBusyFeature, setFlash],
   );
 
-  const setMediaTarget = useCallback(
-    async (tabId: number | null, index: number) => {
+  const setMediaIndex = useCallback(
+    async (index: number) => {
+      const tabId = payload.mediaPlaybackState.tabId;
       if (!tabId) {
         return;
       }
       try {
         const next = await sendRuntimeMessage<PopupStatePayload>({
-          type: "popup_set_media_target",
+          type: "popup_set_media_index",
           tabId,
           index,
         });
@@ -446,50 +458,57 @@ export function usePopupBridge(activeView: PopupView) {
         setFlash(getErrorMessage(error, "切换媒体失败"), "error");
       }
     },
-    [applyPopupState, setFlash],
+    [applyPopupState, payload.mediaPlaybackState.tabId, setFlash],
   );
 
   const performMediaAction = useCallback(
     async (action: string, value?: number | boolean) => {
       setIsUpdatingMedia(true);
       try {
-        const sendDesktopMediaAction = async (nextAction: string, nextValue?: number | boolean) => {
-          const result = await sendRuntimeMessage<DesktopRequestResult>({
-            type: "popup_media_action",
-            action: nextAction,
-            value: nextValue,
-          });
-          if (!result.ok) {
-            throw new Error(result.message || "媒体控制失败");
-          }
-        };
+        const tabId = payload.mediaPlaybackState.tabId;
+        const index = payload.mediaPlaybackState.mediaIndex;
+        if (!tabId || index < 0) {
+          throw new Error("当前没有可控制的媒体");
+        }
 
-        if (action === "pip" || action === "fullscreen") {
-          const tabId = payload.selectedMediaTabId;
-          const index = payload.selectedMediaIndex;
-          if (!tabId || index < 0) {
-            throw new Error("当前没有可控制的媒体");
-          }
-
-          if (action === "fullscreen") {
-            await highlightTab(tabId);
-          }
-
-          const response = await sendMessageToTab<{ ok?: boolean; message?: string }>(
-            tabId,
-            {
-              Message: action === "fullscreen" ? "fullScreen" : "pip",
-              index,
-            },
-            { frameId: payload.mediaPlaybackState.frameId ?? 0 },
-          );
-
-          if (response?.ok === false) {
-            throw new Error(response.message || "媒体控制失败");
-          }
-
-          await refreshState("advanced");
+        if (action === "fullscreen") {
+          await sendFullscreenMessage(tabId, index);
           return;
+        }
+
+        const mediaMessage: Record<string, unknown> = { index };
+        switch (action) {
+          case "toggle_play":
+            mediaMessage.Message = payload.mediaPlaybackState.paused ? "play" : "pause";
+            break;
+          case "set_speed":
+            mediaMessage.Message = "speed";
+            mediaMessage.speed = Number(value ?? 1);
+            break;
+          case "pip":
+            mediaMessage.Message = "pip";
+            break;
+          case "screenshot":
+            mediaMessage.Message = "screenshot";
+            break;
+          case "toggle_loop":
+            mediaMessage.Message = "loop";
+            mediaMessage.action = Boolean(value);
+            break;
+          case "toggle_muted":
+            mediaMessage.Message = "muted";
+            mediaMessage.action = Boolean(value);
+            break;
+          case "set_volume":
+            mediaMessage.Message = "setVolume";
+            mediaMessage.volume = Number(value ?? 1);
+            break;
+          case "set_time":
+            mediaMessage.Message = "setTime";
+            mediaMessage.time = Number(value ?? 0);
+            break;
+          default:
+            throw new Error("未知的媒体操作");
         }
 
         if (
@@ -498,10 +517,10 @@ export function usePopupBridge(activeView: PopupView) {
           && value > 0
           && payload.mediaPlaybackState.muted
         ) {
-          await sendDesktopMediaAction("toggle_muted", false);
+          await sendMediaMessage(tabId, { Message: "muted", action: false, index });
         }
 
-        await sendDesktopMediaAction(action, value);
+        await sendMediaMessage(tabId, mediaMessage);
         await refreshState("advanced");
       } catch (error) {
         setFlash(getErrorMessage(error, "媒体控制失败"), "error");
@@ -511,7 +530,14 @@ export function usePopupBridge(activeView: PopupView) {
         }
       }
     },
-    [payload.mediaPlaybackState.frameId, payload.selectedMediaIndex, payload.selectedMediaTabId, refreshState, setFlash],
+    [
+      payload.mediaPlaybackState.muted,
+      payload.mediaPlaybackState.paused,
+      payload.mediaPlaybackState.tabId,
+      payload.mediaPlaybackState.mediaIndex,
+      refreshState,
+      setFlash,
+    ],
   );
 
   const sortedTasks = useMemo(() => sortTasks(payload.tasks), [payload.tasks]);
@@ -534,7 +560,7 @@ export function usePopupBridge(activeView: PopupView) {
     sendResource,
     mergeResources,
     toggleFeature,
-    setMediaTarget,
+    setMediaIndex,
     performMediaAction,
     sortedTasks,
     isTaskBusy: (taskId: string) => busyTaskIds.has(taskId),

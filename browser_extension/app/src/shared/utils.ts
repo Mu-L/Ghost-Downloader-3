@@ -4,10 +4,15 @@ import type {
   GenericTaskSummary,
   ResourceFilter,
 } from "./types";
+import {
+  CAT_CATCH_AUDIO_EXTENSIONS,
+  CAT_CATCH_VIDEO_EXTENSIONS,
+  isCatCatchM3u8,
+  isCatCatchMedia,
+  isCatCatchMpd,
+} from "./cat-catch";
 
 const ACTIVE_STATUSES = new Set(["running", "waiting", "paused", "failed"]);
-const VIDEO_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mov", "avi", "flv", "m4s", "ts"]);
-const AUDIO_EXTENSIONS = new Set(["mp3", "m4a", "flac", "wav", "aac", "opus", "ogg", "m4s"]);
 const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic"]);
 const ARCHIVE_EXTENSIONS = new Set(["zip", "7z", "rar", "tar", "gz", "bz2", "xz"]);
 const PDF_EXTENSIONS = new Set(["pdf"]);
@@ -24,7 +29,6 @@ const DOCUMENT_EXTENSIONS = new Set([
   "key",
   "epub",
 ]);
-const CAT_CATCH_MEDIA_EXTENSIONS = new Set(["ogg", "ogv", "mp4", "webm", "mp3", "wav", "m4a", "3gp", "mpeg", "mov", "m4s", "aac"]);
 
 export type AccentTone = "neutral" | "success" | "info" | "warning" | "danger";
 export type VisualKind =
@@ -216,16 +220,13 @@ function inferParserHint(rawUrl: string, mime: string, extension: string): Resou
   const loweredMime = String(mime || "").toLowerCase();
   const loweredExt = String(extension || "").toLowerCase();
 
-  if (loweredExt === "m3u8" || loweredExt === "m3u" || loweredUrl.includes(".m3u8") || loweredMime.includes("mpegurl")) {
+  if (isCatCatchM3u8(loweredExt, loweredMime) || loweredUrl.includes(".m3u8")) {
     return "m3u8";
   }
-  if (loweredExt === "mpd" || loweredUrl.includes(".mpd") || loweredMime === "application/dash+xml") {
+  if (isCatCatchMpd(loweredExt, loweredMime) || loweredUrl.includes(".mpd")) {
     return "mpd";
   }
-  if (loweredMime.startsWith("video/") || loweredMime.startsWith("audio/")) {
-    return "media";
-  }
-  if (VIDEO_EXTENSIONS.has(loweredExt) || AUDIO_EXTENSIONS.has(loweredExt)) {
+  if (isCatCatchMedia(loweredExt, loweredMime)) {
     return "media";
   }
   if (["zip", "7z", "rar", "pdf", "exe", "msi", "dmg", "pkg", "apk", "iso"].includes(loweredExt)) {
@@ -276,10 +277,10 @@ function inferResourceMediaKind(resource: CapturedResource, extension: string): 
     return "audio";
   }
 
-  if (VIDEO_EXTENSIONS.has(extension) && !AUDIO_EXTENSIONS.has(extension)) {
+  if (CAT_CATCH_VIDEO_EXTENSIONS.has(extension) && !CAT_CATCH_AUDIO_EXTENSIONS.has(extension)) {
     return "video";
   }
-  if (AUDIO_EXTENSIONS.has(extension) && !VIDEO_EXTENSIONS.has(extension)) {
+  if (CAT_CATCH_AUDIO_EXTENSIONS.has(extension) && !CAT_CATCH_VIDEO_EXTENSIONS.has(extension)) {
     return "audio";
   }
   return "";
@@ -304,10 +305,10 @@ function inferVisualKind({
   if (parserHint === "m3u8" || parserHint === "mpd") {
     return "stream";
   }
-  if (loweredMime.startsWith("video/") || VIDEO_EXTENSIONS.has(loweredExtension)) {
+  if (loweredMime.startsWith("video/") || CAT_CATCH_VIDEO_EXTENSIONS.has(loweredExtension)) {
     return "video";
   }
-  if (loweredMime.startsWith("audio/") || AUDIO_EXTENSIONS.has(loweredExtension)) {
+  if (loweredMime.startsWith("audio/") || CAT_CATCH_AUDIO_EXTENSIONS.has(loweredExtension)) {
     return "audio";
   }
   if (loweredMime.startsWith("image/") || IMAGE_EXTENSIONS.has(loweredExtension)) {
@@ -435,34 +436,17 @@ export function canUseOnlineMerge(resource: CapturedResource): boolean {
     return false;
   }
 
-  if (derived.parserHint === "m3u8") {
-    return true;
-  }
-
   const mime = String(resource.mime || "").toLowerCase();
-  if (!mime) {
-    return CAT_CATCH_MEDIA_EXTENSIONS.has(derived.extension);
-  }
-
   return (
-    CAT_CATCH_MEDIA_EXTENSIONS.has(derived.extension)
-    || mime.startsWith("video")
-    || mime.startsWith("audio")
+    derived.parserHint === "m3u8"
+    || derived.parserHint === "mpd"
+    || isCatCatchMedia(derived.extension, mime)
     || mime.endsWith("octet-stream")
   );
 }
 
 export function canUseOnlineMergeSelection(resources: CapturedResource[]): boolean {
-  if (resources.length !== 2) {
-    return false;
-  }
-
-  const allM3U8 = resources.every((resource) => describeResource(resource).parserHint === "m3u8");
-  if (allM3U8) {
-    return resources.every((resource) => describeResource(resource).deliveryTarget === "gd3");
-  }
-
-  return resources.every(canUseOnlineMerge);
+  return resources.length === 2 && resources.every(canUseOnlineMerge);
 }
 
 export function sortResourcesForOnlineMerge(resources: CapturedResource[]): CapturedResource[] {

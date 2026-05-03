@@ -78,14 +78,10 @@ export function App({
             featureStates={bridge.featureStates}
             isFeatureBusy={bridge.isFeatureBusy}
             onFeatureToggle={(feature) => void bridge.toggleFeature(feature)}
-            mediaTabs={bridge.mediaTabs}
             mediaItems={bridge.mediaItems}
-            selectedMediaTabId={bridge.selectedMediaTabId}
-            selectedMediaIndex={bridge.selectedMediaIndex}
             mediaPlaybackState={bridge.mediaPlaybackState}
             mediaBusy={bridge.isUpdatingMedia}
-            onMediaTabChange={(tabId) => void bridge.setMediaTarget(tabId, -1)}
-            onMediaItemChange={(index) => void bridge.setMediaTarget(bridge.selectedMediaTabId, index)}
+            onMediaItemChange={(index) => void bridge.setMediaIndex(index)}
             onMediaAction={(action, value) => void bridge.performMediaAction(action, value)}
           />
         ) : null}

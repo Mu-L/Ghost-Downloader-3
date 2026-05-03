@@ -25,7 +25,6 @@ import {
 
 const desktopBridge = createDesktopBridge();
 const resourceBridge = createResourceBridge({
-  isDesktopReady: () => desktopBridge.isReady(),
   sendDesktopRequest: (payload) => desktopBridge.sendRequest(payload),
 });
 const featureBridge = createFeatureBridge();
@@ -44,20 +43,15 @@ function taskCounters(tasks: GenericTaskSummary[]) {
 async function buildPopupState(options: {
   preferredTabId?: number | null;
   currentView?: PopupView;
-  refreshMediaInventory?: boolean;
 } = {}): Promise<PopupStatePayload> {
   const resolvedTabId = await resourceBridge.resolveActiveTabId(options.preferredTabId ?? null);
   const activeTab = resolvedTabId != null ? await getTab(resolvedTabId) : null;
   const desktopState = desktopBridge.buildSnapshot();
   const resourceState = resourceBridge.buildPopupStateData(resolvedTabId, activeTab);
 
-  const mediaPanelState =
-    options.currentView === "advanced" || options.refreshMediaInventory
-      ? await mediaBridge.buildPanelState(resolvedTabId, {
-          refreshInventory: Boolean(options.refreshMediaInventory),
-          refreshTarget: true,
-        })
-      : mediaBridge.getLastPanelState();
+  const mediaPanelState = await mediaBridge.buildPanelState(
+    options.currentView === "advanced" ? resolvedTabId : null,
+  );
 
   return {
     connectionState: desktopState.connectionState,
@@ -70,10 +64,7 @@ async function buildPopupState(options: {
     taskCounters: taskCounters(desktopState.tasks),
     tabId: resolvedTabId,
     featureStates: featureBridge.createFeatureStateMap(resolvedTabId),
-    mediaTabs: mediaPanelState.mediaTabs,
     mediaItems: mediaPanelState.mediaItems,
-    selectedMediaTabId: mediaPanelState.selectedMediaTabId,
-    selectedMediaIndex: mediaPanelState.selectedMediaIndex,
     mediaPlaybackState: mediaPanelState.playbackState,
     ...resourceState,
   };
@@ -91,7 +82,6 @@ async function initialize() {
   await desktopBridge.loadPersistentState();
   await resourceBridge.loadPersistentState();
   await featureBridge.loadPersistentState();
-  await mediaBridge.loadPersistentState();
   await resourceBridge.resolveActiveTabId();
 
   if (desktopBridge.buildSnapshot().token) {
@@ -103,6 +93,12 @@ async function initialize() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   desktopBridge.handleReconnectAlarm(alarm);
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "HeartBeat") {
+    port.postMessage("HeartBeat");
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -134,13 +130,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.webNavigation.onCommitted.addListener((details) => {
   resourceBridge.handleNavigationCommitted(details);
-  mediaBridge.handleNavigationCommitted(details);
   featureBridge.handleNavigationCommitted(details);
 });
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     resourceBridge.handleRequestHeaders(details);
+    void resourceBridge.captureRequestResource(details);
   },
   { urls: ["<all_urls>"] },
   getOnSendHeadersExtraInfoSpec(),
@@ -154,25 +150,12 @@ chrome.webRequest.onResponseStarted.addListener(
   ["responseHeaders"],
 );
 
-chrome.webRequest.onErrorOccurred.addListener(
-  (details) => {
-    resourceBridge.clearRequestHeaders(details.requestId);
-  },
-  { urls: ["<all_urls>"] },
-);
-
-chrome.webRequest.onCompleted.addListener(
-  (details) => {
-    resourceBridge.clearRequestHeaders(details.requestId);
-  },
-  { urls: ["<all_urls>"] },
-);
-
 async function interceptBrowserDownload(
   downloadItem: chrome.downloads.DownloadItem,
   options: { eraseFromHistory?: boolean } = {},
 ) {
-  if (!resourceBridge.shouldHandoffBrowserDownload(downloadItem, interceptDownloads)) {
+  const finalUrl = downloadItem.finalUrl || downloadItem.url;
+  if (!interceptDownloads || !desktopBridge.isReady() || !/^https?:/i.test(finalUrl)) {
     return;
   }
 
@@ -188,6 +171,11 @@ async function interceptBrowserDownload(
   await resourceBridge.handoffBrowserDownload(downloadItem);
 }
 
+function reply(sendResponse: (response?: unknown) => void, response: Promise<unknown>) {
+  void response.then(sendResponse);
+  return true;
+}
+
 if (supportsDownloadDeterminingFilename()) {
   chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     suggest();
@@ -200,14 +188,24 @@ if (supportsDownloadDeterminingFilename()) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || typeof message.type !== "string") {
+  if (!message || typeof message !== "object") {
     return;
   }
 
-  if (message.type === "bridge_page_media") {
-    void resourceBridge.capturePageResource(sender, message.payload);
-    sendResponse({ ok: true });
+  if (message.Message === "addMedia" && typeof message.url === "string") {
+    void resourceBridge.capturePageResource(sender, {
+      url: message.url,
+      href: message.href,
+      mime: message.mime,
+      ext: message.extraExt,
+      requestHeaders: message.requestHeaders,
+    });
+    sendResponse("ok");
     return true;
+  }
+
+  if (typeof message.type !== "string") {
+    return;
   }
 
   if (message.type === "bridge_page_command") {
@@ -217,125 +215,98 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "popup_get_state") {
-    void (async () => {
-      sendResponse(
-        await buildPopupState({
-          preferredTabId: typeof message.tabId === "number" ? message.tabId : null,
-          currentView: message.view as PopupView | undefined,
-        }),
-      );
-    })();
-    return true;
+    return reply(sendResponse, buildPopupState({
+      preferredTabId: typeof message.tabId === "number" ? message.tabId : null,
+      currentView: message.view as PopupView | undefined,
+    }));
   }
 
   if (message.type === "popup_set_token") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       await desktopBridge.setToken(String(message.token ?? "").trim());
-      sendResponse(await buildPopupState({ currentView: message.view as PopupView | undefined }));
-    })();
-    return true;
+      return buildPopupState({ currentView: message.view as PopupView | undefined });
+    })());
   }
 
   if (message.type === "popup_set_server_url") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       await desktopBridge.setServerUrl(String(message.serverUrl ?? ""));
-      sendResponse(await buildPopupState({ currentView: message.view as PopupView | undefined }));
-    })();
-    return true;
+      return buildPopupState({ currentView: message.view as PopupView | undefined });
+    })());
   }
 
   if (message.type === "popup_refresh_connection") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       await desktopBridge.connect(true);
-      sendResponse(await buildPopupState({ currentView: message.view as PopupView | undefined }));
-    })();
-    return true;
+      return buildPopupState({ currentView: message.view as PopupView | undefined });
+    })());
   }
 
   if (message.type === "popup_set_intercept_downloads") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       interceptDownloads = Boolean(message.enabled);
       await chrome.storage.local.set({ [INTERCEPT_DOWNLOADS_KEY]: interceptDownloads });
-      sendResponse(await buildPopupState({ currentView: message.view as PopupView | undefined }));
-    })();
-    return true;
+      return buildPopupState({ currentView: message.view as PopupView | undefined });
+    })());
   }
 
   if (message.type === "popup_task_action") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       try {
-        const result = await desktopBridge.sendRequest<DesktopRequestResult>({
+        return await desktopBridge.sendRequest<DesktopRequestResult>({
           type: "task_action",
           taskId: message.taskId,
           action: message.action,
         });
-        sendResponse(result);
       } catch (error) {
-        sendResponse({
+        return {
           ok: false,
           message: error instanceof Error ? error.message : "任务操作失败",
-        });
+        };
       }
-    })();
-    return true;
+    })());
   }
 
   if (message.type === "popup_send_resource") {
-    void (async () => {
-      sendResponse(await resourceBridge.sendResource(String(message.resourceId ?? "")));
-    })();
-    return true;
+    return reply(sendResponse, resourceBridge.sendResource(String(message.resourceId ?? "")));
   }
 
   if (message.type === "popup_merge_resources") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       const resourceIds = Array.isArray(message.resourceIds)
         ? message.resourceIds.map((value: unknown) => String(value ?? "")).filter(Boolean)
         : [];
-      sendResponse(await resourceBridge.mergeResources(resourceIds));
-    })();
-    return true;
+      return resourceBridge.mergeResources(resourceIds);
+    })());
   }
 
   if (message.type === "popup_toggle_feature") {
-    void (async () => {
+    return reply(sendResponse, (async () => {
       const tabId = typeof message.tabId === "number" ? message.tabId : null;
       if (tabId == null) {
-        sendResponse({ ok: false, message: "当前没有可操作的标签页" });
-        return;
+        return { ok: false, message: "当前没有可操作的标签页" };
       }
       try {
         const infoMessage = await featureBridge.toggleFeature(message.feature as AdvancedFeatureKey, tabId);
-        sendResponse({ ok: true, message: infoMessage });
+        return { ok: true, message: infoMessage };
       } catch (error) {
-        sendResponse({
+        return {
           ok: false,
           message: error instanceof Error ? error.message : "功能切换失败",
-        });
+        };
       }
-    })();
-    return true;
+    })());
   }
 
-  if (message.type === "popup_set_media_target") {
-    void (async () => {
-      await mediaBridge.setMediaTarget(Number(message.tabId ?? 0), Number(message.index ?? -1));
-      sendResponse(
-        await buildPopupState({
-          currentView: "advanced",
-          refreshMediaInventory: true,
-        }),
-      );
-    })();
-    return true;
+  if (message.type === "popup_set_media_index") {
+    return reply(sendResponse, (async () => {
+      await mediaBridge.setMediaIndex(Number(message.tabId ?? 0), Number(message.index ?? -1));
+      return buildPopupState({
+        currentView: "advanced",
+      });
+    })());
   }
 
-  if (message.type === "popup_media_action") {
-    void (async () => {
-      sendResponse(await mediaBridge.performAction(String(message.action ?? ""), message.value));
-    })();
-    return true;
-  }
 });
 
 void initialize();

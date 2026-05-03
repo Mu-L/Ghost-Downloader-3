@@ -6,7 +6,6 @@ import type {
   FeatureStateMap,
   MediaItemOption,
   MediaPlaybackState,
-  MediaTabOption,
 } from "../../shared/types";
 import { FeatureToggleCard } from "./FeatureToggleCard";
 import { MediaControlPanel } from "./MediaControlPanel";
@@ -34,26 +33,18 @@ export function AdvancedPage({
   featureStates,
   isFeatureBusy,
   onFeatureToggle,
-  mediaTabs,
   mediaItems,
-  selectedMediaTabId,
-  selectedMediaIndex,
   mediaPlaybackState,
   mediaBusy,
-  onMediaTabChange,
   onMediaItemChange,
   onMediaAction,
 }: {
   featureStates: FeatureStateMap;
   isFeatureBusy: (featureKey: AdvancedFeatureKey) => boolean;
   onFeatureToggle: (feature: AdvancedFeatureKey) => void;
-  mediaTabs: MediaTabOption[];
   mediaItems: MediaItemOption[];
-  selectedMediaTabId: number | null;
-  selectedMediaIndex: number;
   mediaPlaybackState: MediaPlaybackState;
   mediaBusy?: boolean;
-  onMediaTabChange: (tabId: number) => void;
   onMediaItemChange: (index: number) => void;
   onMediaAction: (action: string, value?: number | boolean) => void;
 }) {
@@ -70,13 +61,9 @@ export function AdvancedPage({
       </MessageBar>
 
       <MediaControlPanel
-        mediaTabs={mediaTabs}
         mediaItems={mediaItems}
-        selectedTabId={selectedMediaTabId}
-        selectedIndex={selectedMediaIndex}
         playbackState={mediaPlaybackState}
         busy={mediaBusy}
-        onChangeTab={onMediaTabChange}
         onChangeMedia={onMediaItemChange}
         onAction={onMediaAction}
       />
