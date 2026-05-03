@@ -1,6 +1,8 @@
 import type { CapturedResource, DesktopRequestResult, PopupStatePayload } from "../shared/types";
 import {
+  canUseOnlineMerge,
   canUseOnlineMergeSelection,
+  describeResource,
   domainFromUrl,
   fileExtension,
   filenameFromUrl,
@@ -526,6 +528,26 @@ export function createResourceBridge(options: {
     return sortResources(result);
   }
 
+  function tabMediaResources(tabId: number): CapturedResource[] {
+    return sortResources(resourceCache.get(tabId)?.values() ?? [])
+      .filter((resource) => /^https?:/i.test(resource.url) && canUseOnlineMerge(resource));
+  }
+
+  function canSendOneClickResource(resource: CapturedResource): boolean {
+    const hint = describeResource(resource).parserHint;
+    return hint === "m3u8" || hint === "mpd" || resource.size > 0 || resource.supportsRange;
+  }
+
+  function recentAudioVideoPair(resources: CapturedResource[]): CapturedResource[] {
+    const recentResources = resources.filter((resource) => Date.now() - resource.capturedAt <= 120000);
+    const video = recentResources.find((resource) => describeResource(resource).category === "video");
+    const audio = recentResources.find((resource) => describeResource(resource).category === "audio");
+    if (!video || !audio || Math.abs(video.capturedAt - audio.capturedAt) > 30000) {
+      return [];
+    }
+    return canUseOnlineMergeSelection([video, audio]) ? [video, audio] : [];
+  }
+
   function deriveMergeOutputTitle(resources: CapturedResource[]): string {
     const pageTitle = String(resources[0]?.pageTitle || "").trim();
     if (pageTitle) {
@@ -817,6 +839,42 @@ export function createResourceBridge(options: {
     }
   }
 
+  async function downloadPageMedia(sender: chrome.runtime.MessageSender, payload: BridgeResourcePayload): Promise<DesktopRequestResult> {
+    const tabId = await resolveBridgeResourceTabId(sender, payload.href);
+    if (!tabId) {
+      return { ok: false, message: "当前没有可操作的标签页" };
+    }
+
+    const exactResource = payload.url ? findResourceByUrl(payload.url) : null;
+    if (exactResource?.tabId === tabId && canSendOneClickResource(exactResource)) {
+      return sendResource(exactResource.id);
+    }
+
+    const candidates = tabMediaResources(tabId).filter(canSendOneClickResource);
+    const streamResource = candidates.find((resource) => {
+      const hint = describeResource(resource).parserHint;
+      return hint === "m3u8" || hint === "mpd";
+    });
+    if (streamResource) {
+      return sendResource(streamResource.id);
+    }
+
+    const pair = recentAudioVideoPair(candidates);
+    if (pair.length === 2) {
+      return mergeResources(pair.map((resource) => resource.id));
+    }
+
+    if (candidates.length === 1) {
+      return sendResource(candidates[0].id);
+    }
+
+    await openActionPopup();
+    return {
+      ok: false,
+      message: candidates.length > 1 ? "找到多个媒体资源，请在资源嗅探页选择" : "尚未捕获到可下载媒体资源",
+    };
+  }
+
   async function mergeResources(resourceIds: string[]): Promise<DesktopRequestResult> {
     const ids = [...new Set(resourceIds.map((value) => String(value || "")).filter(Boolean))];
     const resources = ids
@@ -924,6 +982,7 @@ export function createResourceBridge(options: {
     captureNetworkResource,
     capturePageResource,
     captureRequestResource,
+    downloadPageMedia,
     handoffBrowserDownload,
     handleNavigationCommitted,
     handleRequestHeaders,

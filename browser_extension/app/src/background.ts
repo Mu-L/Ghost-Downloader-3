@@ -11,12 +11,15 @@ import { createMediaBridge } from "./background/media-bridge";
 import { createResourceBridge } from "./background/resource-bridge";
 import {
   INTERCEPT_DOWNLOADS_KEY,
+  MEDIA_DOWNLOAD_OVERLAY_KEY,
 } from "./background/constants";
 import {
   cancelDownload,
   eraseDownloadFromHistory,
   getTab,
   localStorageGet,
+  openActionPopup,
+  queryTabs,
 } from "./background/chrome-helpers";
 import {
   getOnSendHeadersExtraInfoSpec,
@@ -31,6 +34,48 @@ const featureBridge = createFeatureBridge();
 const mediaBridge = createMediaBridge();
 
 let interceptDownloads = true;
+let mediaDownloadOverlayEnabled = true;
+
+async function injectMediaDownloadOverlay(tabId: number) {
+  if (!mediaDownloadOverlayEnabled) {
+    return;
+  }
+  const tab = await getTab(tabId);
+  if (!tab?.url || !/^https?:/i.test(tab.url)) {
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      files: ["catch-script/media-download-overlay.js"],
+      injectImmediately: false,
+      target: { tabId, allFrames: true },
+    });
+  } catch {
+    // Ignore pages that do not allow extension injection.
+  }
+}
+
+async function syncMediaDownloadOverlay(enabled: boolean) {
+  mediaDownloadOverlayEnabled = enabled;
+  await chrome.storage.local.set({ [MEDIA_DOWNLOAD_OVERLAY_KEY]: enabled });
+
+  const tabs = await queryTabs({});
+  for (const tab of tabs) {
+    if (!tab.id || !tab.url || !/^https?:/i.test(tab.url)) {
+      continue;
+    }
+    chrome.tabs.sendMessage(tab.id, {
+      type: "media_download_overlay_set_enabled",
+      enabled,
+    }, () => {
+      const lastError = chrome.runtime.lastError;
+      if (enabled && lastError && tab.id) {
+        void injectMediaDownloadOverlay(tab.id);
+      }
+    });
+  }
+}
 
 function taskCounters(tasks: GenericTaskSummary[]) {
   return {
@@ -60,6 +105,7 @@ async function buildPopupState(options: {
     token: desktopState.token,
     serverUrl: desktopState.serverUrl,
     interceptDownloads,
+    mediaDownloadOverlayEnabled,
     tasks: desktopState.tasks,
     taskCounters: taskCounters(desktopState.tasks),
     tabId: resolvedTabId,
@@ -73,16 +119,22 @@ async function buildPopupState(options: {
 async function initialize() {
   const localState = await localStorageGet<{
     [INTERCEPT_DOWNLOADS_KEY]: boolean;
+    [MEDIA_DOWNLOAD_OVERLAY_KEY]: boolean;
   }>({
     [INTERCEPT_DOWNLOADS_KEY]: true,
+    [MEDIA_DOWNLOAD_OVERLAY_KEY]: true,
   });
 
   interceptDownloads = Boolean(localState[INTERCEPT_DOWNLOADS_KEY] ?? true);
+  mediaDownloadOverlayEnabled = Boolean(localState[MEDIA_DOWNLOAD_OVERLAY_KEY] ?? true);
 
   await desktopBridge.loadPersistentState();
   await resourceBridge.loadPersistentState();
   await featureBridge.loadPersistentState();
-  await resourceBridge.resolveActiveTabId();
+  const activeTabId = await resourceBridge.resolveActiveTabId();
+  if (activeTabId != null) {
+    void injectMediaDownloadOverlay(activeTabId);
+  }
 
   if (desktopBridge.buildSnapshot().token) {
     void desktopBridge.connect();
@@ -109,17 +161,25 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes[INTERCEPT_DOWNLOADS_KEY]) {
     interceptDownloads = Boolean(changes[INTERCEPT_DOWNLOADS_KEY].newValue ?? true);
   }
+  if (changes[MEDIA_DOWNLOAD_OVERLAY_KEY]) {
+    mediaDownloadOverlayEnabled = Boolean(changes[MEDIA_DOWNLOAD_OVERLAY_KEY].newValue ?? true);
+  }
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
   void resourceBridge.setLastActiveTab(activeInfo.tabId);
+  void injectMediaDownloadOverlay(activeInfo.tabId);
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
     return;
   }
-  void resourceBridge.refreshActiveTabFromBrowser();
+  void resourceBridge.refreshActiveTabFromBrowser().then((tabId) => {
+    if (tabId != null) {
+      void injectMediaDownloadOverlay(tabId);
+    }
+  });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -250,6 +310,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })());
   }
 
+  if (message.type === "popup_set_media_download_overlay") {
+    return reply(sendResponse, (async () => {
+      await syncMediaDownloadOverlay(Boolean(message.enabled));
+      return buildPopupState({ currentView: message.view as PopupView | undefined });
+    })());
+  }
+
   if (message.type === "popup_task_action") {
     return reply(sendResponse, (async () => {
       try {
@@ -278,6 +345,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         : [];
       return resourceBridge.mergeResources(resourceIds);
     })());
+  }
+
+  if (message.type === "page_download_media") {
+    return reply(sendResponse, (async () => {
+      const result = await resourceBridge.downloadPageMedia(sender, {
+        url: String(message.url ?? ""),
+        href: String(message.href ?? ""),
+        filename: String(message.filename ?? ""),
+      });
+      if (result.ok) {
+        await openActionPopup();
+      }
+      return result;
+    })());
+  }
+
+  if (message.type === "page_media_overlay_state") {
+    sendResponse({ enabled: mediaDownloadOverlayEnabled });
+    return;
   }
 
   if (message.type === "popup_toggle_feature") {

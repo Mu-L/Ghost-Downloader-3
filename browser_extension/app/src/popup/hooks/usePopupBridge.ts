@@ -65,6 +65,7 @@ function createEmptyPayload(): PopupStatePayload {
     token: "",
     serverUrl: "",
     interceptDownloads: true,
+    mediaDownloadOverlayEnabled: true,
     tasks: [],
     taskCounters: { total: 0, active: 0, completed: 0 },
     resourceState: "restoring",
@@ -160,6 +161,7 @@ export function usePopupBridge(activeView: PopupView) {
   const [isSavingServerUrl, setIsSavingServerUrl] = useState(false);
   const [isRefreshingConnection, setIsRefreshingConnection] = useState(false);
   const [isUpdatingIntercept, setIsUpdatingIntercept] = useState(false);
+  const [isUpdatingMediaDownloadOverlay, setIsUpdatingMediaDownloadOverlay] = useState(false);
   const [isUpdatingMedia, setIsUpdatingMedia] = useState(false);
 
   const mountedRef = useRef(true);
@@ -350,6 +352,26 @@ export function usePopupBridge(activeView: PopupView) {
       } finally {
         if (mountedRef.current) {
           setIsUpdatingIntercept(false);
+        }
+      }
+    },
+    [applyPopupState, requestPopupState, setFlash],
+  );
+
+  const setMediaDownloadOverlay = useCallback(
+    async (enabled: boolean) => {
+      setIsUpdatingMediaDownloadOverlay(true);
+      try {
+        const next = await requestPopupState({
+          type: "popup_set_media_download_overlay",
+          enabled,
+        });
+        applyPopupState(next);
+      } catch (error) {
+        setFlash(getErrorMessage(error, "更新下载按钮失败"), "error");
+      } finally {
+        if (mountedRef.current) {
+          setIsUpdatingMediaDownloadOverlay(false);
         }
       }
     },
@@ -551,11 +573,13 @@ export function usePopupBridge(activeView: PopupView) {
     isSavingServerUrl,
     isRefreshingConnection,
     isUpdatingIntercept,
+    isUpdatingMediaDownloadOverlay,
     isUpdatingMedia,
     saveToken,
     saveServerUrl,
     refreshConnection,
     setInterceptDownloads,
+    setMediaDownloadOverlay,
     performTaskAction,
     sendResource,
     mergeResources,

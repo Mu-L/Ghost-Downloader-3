@@ -44,9 +44,12 @@ export function App({
         currentView={currentView}
         connectionState={bridge.connectionState}
         connectionMessage={bridge.connectionMessage}
+        mediaDownloadOverlayEnabled={bridge.mediaDownloadOverlayEnabled}
+        mediaDownloadOverlayBusy={bridge.isUpdatingMediaDownloadOverlay}
         interceptEnabled={bridge.interceptDownloads}
         interceptBusy={bridge.isUpdatingIntercept}
         onViewChange={setCurrentView}
+        onMediaDownloadOverlayToggle={(enabled) => void bridge.setMediaDownloadOverlay(enabled)}
         onInterceptToggle={(enabled) => void bridge.setInterceptDownloads(enabled)}
       />
 

@@ -98,6 +98,7 @@ export interface PopupStatePayload {
   token: string;
   serverUrl: string;
   interceptDownloads: boolean;
+  mediaDownloadOverlayEnabled: boolean;
   tasks: GenericTaskSummary[];
   taskCounters: TaskCounters;
   resourceState: ResourceCollectionState;

@@ -37,6 +37,12 @@
       "js": ["cat-catch-content-script.js", "content-script.js"],
       "run_at": "document_start",
       "all_frames": true
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["catch-script/media-download-overlay.js"],
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "web_accessible_resources": [
