@@ -99,9 +99,11 @@ export function App({
             savingToken={bridge.isSavingToken}
             savingServerUrl={bridge.isSavingServerUrl}
             refreshingConnection={bridge.isRefreshingConnection}
+            requestingPairing={bridge.isRequestingPairing}
             onSaveToken={bridge.saveToken}
             onSaveServerUrl={bridge.saveServerUrl}
             onRefreshConnection={bridge.refreshConnection}
+            onRequestPairing={bridge.requestPairing}
             themePreference={themePreference}
             resolvedThemePreference={resolvedThemePreference}
             onThemePreferenceChange={onThemePreferenceChange}

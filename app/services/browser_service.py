@@ -4,18 +4,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from secrets import token_urlsafe
 
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import QObject, QTimer, Slot, Qt
 from PySide6.QtNetwork import QHostAddress
 from PySide6.QtWebSockets import QWebSocketServer
 from loguru import logger
 from orjson import dumps, loads
+from qfluentwidgets import MessageBox
 
 from app.bases.models import Task, TaskStatus
 from app.services.core_service import coreService
 from app.services.feature_service import featureService
 from app.supports.config import VERSION, cfg
 from app.supports.recorder import taskRecorder
-from app.supports.utils import getProxies, openFile, openFolder
+from app.supports.utils import bringWindowToTop, getProxies, openFile, openFolder
 
 if TYPE_CHECKING:
     from PySide6.QtWebSockets import QWebSocket
@@ -35,6 +36,8 @@ class BrowserMessageType(StrEnum):
     ERROR = "error"
     HELLO = "hello"
     HELLO_ACK = "hello_ack"
+    PAIR_REQUEST = "pair_request"
+    PAIR_RESULT = "pair_result"
     SUBSCRIBE_TASKS = "subscribe_tasks"
     TASK_SNAPSHOT = "task_snapshot"
     CREATE_TASK = "create_task"
@@ -203,6 +206,41 @@ class BrowserService(QObject):
         if requestId:
             payload["requestId"] = requestId
         self._send(session, payload)
+
+    def _showPairRequestDialog(self, session: _BrowserClientSession, data: dict[str, Any]) -> bool:
+        extensionVersion = self._stringField(data, "extensionVersion", self.tr("未知"))
+        clientKind = self._stringField(data, "clientKind", self.tr("浏览器扩展"))
+        peerAddress = f"{session.socket.peerAddress().toString()}:{session.socket.peerPort()}"
+        content = self.tr(
+            "浏览器扩展正在请求连接到 Ghost Downloader。\n\n"
+            "来源: {0}\n"
+            "客户端: {1}\n"
+            "扩展版本: {2}\n\n"
+            "仅在你刚刚点击扩展里的“自动配对”时允许。"
+        ).format(peerAddress, clientKind, extensionVersion)
+
+        bringWindowToTop(self.mainWindow)
+        dialog = MessageBox(self.tr("浏览器扩展配对请求"), content, self.mainWindow)
+        dialog.yesButton.setText(self.tr("允许配对"))
+        dialog.cancelButton.setText(self.tr("拒绝"))
+        dialog.contentLabel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return bool(dialog.exec())
+
+    def _handlePairRequest(self, session: _BrowserClientSession, data: dict[str, Any]) -> None:
+        requestId = self._stringField(data, "requestId")
+
+        if int(data.get("protocolVersion") or 0) != self.PROTOCOL_VERSION:
+            result = {"ok": False, "message": self.tr("协议版本不匹配")}
+        elif not self._showPairRequestDialog(session, data):
+            result = {"ok": False, "message": self.tr("已拒绝配对请求")}
+        else:
+            result = {"ok": True, "message": self.tr("配对成功"), "token": self.pairToken}
+
+        self._send(session, {
+            "type": BrowserMessageType.PAIR_RESULT,
+            "requestId": requestId,
+            **result,
+        })
 
     @staticmethod
     def _stringField(data: dict[str, Any], key: str, default: str = "") -> str:
@@ -689,6 +727,10 @@ class BrowserService(QObject):
             messageType = BrowserMessageType(rawMessageType)
         except ValueError:
             self._sendError(session, self.tr("未知的消息类型"))
+            return
+
+        if messageType == BrowserMessageType.PAIR_REQUEST:
+            self._handlePairRequest(session, data)
             return
 
         if messageType == BrowserMessageType.HELLO:

@@ -302,6 +302,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })());
   }
 
+  if (message.type === "popup_request_pairing") {
+    void desktopBridge.requestPairing().catch(() => {
+      // The bridge snapshot carries the user-facing pairing failure message.
+    });
+    sendResponse({ ok: true, message: "配对请求已发送，请在桌面端确认" });
+    return true;
+  }
+
   if (message.type === "popup_set_intercept_downloads") {
     return reply(sendResponse, (async () => {
       interceptDownloads = Boolean(message.enabled);

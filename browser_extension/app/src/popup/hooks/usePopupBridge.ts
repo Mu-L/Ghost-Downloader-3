@@ -60,7 +60,7 @@ function createEmptyMediaState(): MediaPlaybackState {
 function createEmptyPayload(): PopupStatePayload {
   return {
     connectionState: "missing_token",
-    connectionMessage: "请先在扩展设置里填写配对令牌",
+    connectionMessage: "请在扩展设置页自动配对桌面端",
     desktopVersion: "",
     token: "",
     serverUrl: "",
@@ -160,6 +160,7 @@ export function usePopupBridge(activeView: PopupView) {
   const [isSavingToken, setIsSavingToken] = useState(false);
   const [isSavingServerUrl, setIsSavingServerUrl] = useState(false);
   const [isRefreshingConnection, setIsRefreshingConnection] = useState(false);
+  const [isRequestingPairing, setIsRequestingPairing] = useState(false);
   const [isUpdatingIntercept, setIsUpdatingIntercept] = useState(false);
   const [isUpdatingMediaDownloadOverlay, setIsUpdatingMediaDownloadOverlay] = useState(false);
   const [isUpdatingMedia, setIsUpdatingMedia] = useState(false);
@@ -337,6 +338,30 @@ export function usePopupBridge(activeView: PopupView) {
       }
     }
   }, [applyPopupState, requestPopupState, setFlash]);
+
+  const requestPairing = useCallback(async () => {
+    setIsRequestingPairing(true);
+    try {
+      const result = await sendRuntimeMessage<DesktopRequestResult>({
+        type: "popup_request_pairing",
+      });
+      if (!result.ok) {
+        throw new Error(result.message || "自动配对失败");
+      }
+      setFlash(result.message || "配对请求已发送，请在桌面端确认");
+      void refreshState(activeViewRef.current).catch(() => {
+        // Ignore transient popup refresh failures.
+      });
+      return true;
+    } catch (error) {
+      setFlash(getErrorMessage(error, "自动配对失败"), "error");
+      return false;
+    } finally {
+      if (mountedRef.current) {
+        setIsRequestingPairing(false);
+      }
+    }
+  }, [refreshState, setFlash]);
 
   const setInterceptDownloads = useCallback(
     async (enabled: boolean) => {
@@ -572,12 +597,14 @@ export function usePopupBridge(activeView: PopupView) {
     isSavingToken,
     isSavingServerUrl,
     isRefreshingConnection,
+    isRequestingPairing,
     isUpdatingIntercept,
     isUpdatingMediaDownloadOverlay,
     isUpdatingMedia,
     saveToken,
     saveServerUrl,
     refreshConnection,
+    requestPairing,
     setInterceptDownloads,
     setMediaDownloadOverlay,
     performTaskAction,

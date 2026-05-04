@@ -285,13 +285,13 @@ def getLocalTimeFromGithubApiTime(gmtTimeStr: str) -> str:
     return localTime.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def bringWindowToTop(window):
+def bringWindowToTop(window) -> None:
     window.show()
-    if window.isMinimized():
-        window.showNormal()
-    # 激活窗口，使其显示在最前面
-    window.activateWindow()
+    window.setWindowState(
+        (window.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+    )
     window.raise_()
+    window.activateWindow()
 
 
 def showMessageBox(

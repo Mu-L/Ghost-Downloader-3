@@ -12,6 +12,7 @@ import {
 import {
   ArrowClockwiseRegular,
   ClipboardPasteRegular,
+  PlugConnectedRegular,
 } from "@fluentui/react-icons";
 import { useEffect, useState } from "react";
 
@@ -81,9 +82,11 @@ export function SettingsPage({
   savingToken,
   savingServerUrl,
   refreshingConnection,
+  requestingPairing,
   onSaveToken,
   onSaveServerUrl,
   onRefreshConnection,
+  onRequestPairing,
   themePreference,
   resolvedThemePreference,
   onThemePreferenceChange,
@@ -96,9 +99,11 @@ export function SettingsPage({
   savingToken?: boolean;
   savingServerUrl?: boolean;
   refreshingConnection?: boolean;
+  requestingPairing?: boolean;
   onSaveToken: (value: string) => Promise<boolean>;
   onSaveServerUrl: (value: string) => Promise<boolean>;
   onRefreshConnection: () => Promise<boolean>;
+  onRequestPairing: () => Promise<boolean>;
   themePreference: ThemePreference;
   resolvedThemePreference: Exclude<ThemePreference, "system">;
   onThemePreferenceChange: (nextPreference: ThemePreference) => void;
@@ -167,7 +172,17 @@ export function SettingsPage({
       <Card appearance="filled-alternative" className={styles.card}>
         <div className={styles.header}>
           <Body1Strong>连接配置</Body1Strong>
-          <ConnectionStatusBadge state={connectionState} message={connectionMessage} />
+          <div className={styles.inputRow}>
+            <ConnectionStatusBadge state={connectionState} message={connectionMessage} />
+            <Button
+              appearance="primary"
+              disabled={requestingPairing || savingToken || savingServerUrl}
+              icon={<PlugConnectedRegular />}
+              onClick={() => void onRequestPairing()}
+            >
+              自动配对
+            </Button>
+          </div>
         </div>
 
         <Field label="本地服务地址">

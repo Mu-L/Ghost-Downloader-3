@@ -18,6 +18,16 @@ type PendingRequest = {
   timeoutId: number;
 };
 
+type PairingResponse = {
+  type?: string;
+  ok?: boolean;
+  token?: string;
+  message?: string;
+};
+
+const PAIRING_TIMEOUT_MS = 60000;
+const MISSING_PAIRING_MESSAGE = "请在扩展设置页自动配对桌面端";
+
 export type DesktopBridgeSnapshot = {
   connectionState: DesktopConnectionState;
   connectionMessage: string;
@@ -32,7 +42,7 @@ export function createDesktopBridge() {
   let reconnectTimer: number | null = null;
 
   let connectionState: DesktopConnectionState = "missing_token";
-  let connectionMessage = "请先在扩展设置里填写配对令牌";
+  let connectionMessage = MISSING_PAIRING_MESSAGE;
   let desktopVersion = "";
   let pairToken = "";
   let serverUrl = DEFAULT_SERVER_URL;
@@ -125,7 +135,7 @@ export function createDesktopBridge() {
     if (!pairToken) {
       desktopVersion = "";
       taskSnapshot = [];
-      setConnectionState("missing_token", "请先在扩展设置里填写配对令牌");
+      setConnectionState("missing_token", MISSING_PAIRING_MESSAGE);
       return;
     }
 
@@ -190,6 +200,83 @@ export function createDesktopBridge() {
     });
   }
 
+  async function requestPairing(): Promise<void> {
+    clearReconnectTimer();
+    setConnectionState("connecting", "正在请求桌面端确认配对");
+
+    try {
+      const token = await new Promise<string>((resolve, reject) => {
+        const socket = new WebSocket(serverUrl);
+        let settled = false;
+        let timeoutId = 0;
+
+        const finish = (done: () => void) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          self.clearTimeout(timeoutId);
+          socket.close();
+          done();
+        };
+
+        timeoutId = self.setTimeout(() => {
+          finish(() => reject(new Error("等待桌面端确认配对超时")));
+        }, PAIRING_TIMEOUT_MS);
+
+        socket.addEventListener("open", () => {
+          socket.send(
+            JSON.stringify({
+              type: "pair_request",
+              requestId: nextRequestId(),
+              protocolVersion: PROTOCOL_VERSION,
+              extensionVersion: chrome.runtime.getManifest().version,
+              clientKind: "browser_extension",
+            }),
+          );
+        });
+
+        socket.addEventListener("message", (event) => {
+          let response: PairingResponse;
+          try {
+            response = JSON.parse(String(event.data ?? "")) as PairingResponse;
+          } catch {
+            return;
+          }
+          if (response.type !== "pair_result") {
+            return;
+          }
+
+          if (!response.ok) {
+            finish(() => reject(new Error(response.message || "桌面端已拒绝配对请求")));
+            return;
+          }
+
+          const token = String(response.token ?? "").trim();
+          if (!token) {
+            finish(() => reject(new Error("桌面端未返回配对令牌")));
+            return;
+          }
+
+          finish(() => resolve(token));
+        });
+
+        socket.addEventListener("close", () => {
+          finish(() => reject(new Error("配对连接已断开")));
+        });
+
+        socket.addEventListener("error", () => {
+          finish(() => reject(new Error("无法连接到 Ghost Downloader")));
+        });
+      });
+      await setToken(token);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "自动配对失败";
+      setConnectionState(pairToken ? "disconnected" : "missing_token", message);
+      throw error;
+    }
+  }
+
   async function sendRequest<T extends DesktopRequestResult>(payload: Record<string, unknown>): Promise<T> {
     if (!isReady() || !desktopSocket) {
       throw new Error("Ghost Downloader 未连接");
@@ -241,7 +328,7 @@ export function createDesktopBridge() {
       desktopSocket.close();
       desktopSocket = null;
     }
-    setConnectionState("missing_token", "请先在扩展设置里填写配对令牌");
+    setConnectionState("missing_token", MISSING_PAIRING_MESSAGE);
   }
 
   async function setServerUrl(nextServerUrl: string) {
@@ -288,6 +375,7 @@ export function createDesktopBridge() {
     handleReconnectAlarm,
     isReady,
     loadPersistentState,
+    requestPairing,
     sendRequest,
     setServerUrl,
     setToken,
